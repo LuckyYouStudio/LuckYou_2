@@ -1,0 +1,17 @@
+# 环境变量（FR-D-04：敏感值绝不入库）
+.env
+.env.local
+
+# Foundry
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+
+# Node / Next.js
+node_modules/
+web/.next/
+web/out/
+
+# 系统
+.DS_Store
+Thumbs.db

@@ -1,0 +1,27 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.26"
+optimizer = true
+optimizer_runs = 200
+
+# 注意：Chainlink 的 mock 会 import 带版本号的 OpenZeppelin 路径
+# （@openzeppelin/contracts@4.9.6/），必须显式 remap，否则报 Source not found
+remappings = [
+    "@chainlink/contracts/=lib/chainlink-brownie-contracts/contracts/",
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "@openzeppelin/contracts@4.9.6/=lib/openzeppelin-contracts/contracts/",
+]
+
+[fuzz]
+runs = 256
+
+[invariant]
+runs = 64
+depth = 32
+
+[fmt]
+line_length = 100
+tab_width = 4
+bracket_spacing = false
