@@ -280,7 +280,10 @@ export default function Home() {
         <span>LuckYou</span> 本地测试台
       </h1>
       <p className="subtitle">
-        anvil (chainId 31337) · Lottery <span className="addr">{addresses.lottery}</span> · 票价 1 USDC · 抽成 1%
+        anvil (chainId 31337) · Lottery <span className="addr">{addresses.lottery}</span> · 票价 1 USDC · 抽成 1% ·{" "}
+        <a href="/history" style={{ color: "var(--blue)" }}>
+          我的记录 →
+        </a>
       </p>
 
       {wrongChain && <div className="banner" style={{ borderColor: "var(--red)" }}>⚠ RPC 链 ID 不是 31337，请确认 anvil 已启动</div>}
