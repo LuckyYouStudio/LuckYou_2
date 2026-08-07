@@ -14,6 +14,9 @@ remappings = [
     "@openzeppelin/contracts@4.9.6/=lib/openzeppelin-contracts/contracts/",
 ]
 
+# 允许本地部署脚本把地址写给测试前端
+fs_permissions = [{ access = "read-write", path = "../web/src/lib" }]
+
 [fuzz]
 runs = 256
 
