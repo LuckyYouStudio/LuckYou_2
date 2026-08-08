@@ -5,8 +5,8 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
-import { parseAbiItem, type Address } from "viem";
-import { ANVIL_ACCOUNTS, addresses, publicClient } from "@/lib/contracts";
+import { isAddress, parseAbiItem, type Address } from "viem";
+import { ANVIL_ACCOUNTS, IS_LOCAL, addresses, publicClient } from "@/lib/contracts";
 
 const TICKETS_BOUGHT = parseAbiItem(
   "event TicketsBought(uint32 indexed roundId, address indexed buyer, uint32 start, uint32 quantity)",
@@ -37,13 +37,18 @@ function fmt6(x: bigint): string {
 }
 
 export default function History() {
-  const [account, setAccount] = useState<Address>(ANVIL_ACCOUNTS[0].address);
+  const [account, setAccount] = useState<string>(IS_LOCAL ? ANVIL_ACCOUNTS[0].address : "");
   const [buys, setBuys] = useState<BuyRecord[]>([]);
   const [claims, setClaims] = useState<ClaimRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
+    if (!isAddress(account)) {
+      setBuys([]);
+      setClaims([]);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
@@ -56,7 +61,7 @@ export default function History() {
         const bought = await publicClient.getLogs({
           address: addresses.lottery,
           event: TICKETS_BOUGHT,
-          args: { buyer: account },
+          args: { buyer: account as Address },
           fromBlock: from,
           toBlock: to,
         });
@@ -71,7 +76,7 @@ export default function History() {
         const claimed = await publicClient.getLogs({
           address: addresses.lottery,
           event: PRIZE_CLAIMED,
-          args: { winner: account },
+          args: { winner: account as Address },
           fromBlock: from,
           toBlock: to,
         });
@@ -115,13 +120,22 @@ export default function History() {
       <div className="card" style={{ marginBottom: 16 }}>
         <div className="row">
           <span className="k">查询账户</span>
-          <select value={account} onChange={(e) => setAccount(e.target.value as Address)}>
-            {ANVIL_ACCOUNTS.map((a) => (
-              <option key={a.address} value={a.address}>
-                {a.name} {a.address.slice(0, 8)}…
-              </option>
-            ))}
-          </select>
+          {IS_LOCAL ? (
+            <select value={account} onChange={(e) => setAccount(e.target.value)}>
+              {ANVIL_ACCOUNTS.map((a) => (
+                <option key={a.address} value={a.address}>
+                  {a.name} {a.address.slice(0, 8)}…
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              style={{ width: 340 }}
+              placeholder="输入要查询的地址 0x…"
+              value={account}
+              onChange={(e) => setAccount(e.target.value.trim())}
+            />
+          )}
         </div>
         <div className="row">
           <span className="k">累计购票支出</span>

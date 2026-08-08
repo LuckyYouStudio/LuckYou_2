@@ -30,12 +30,24 @@ contract Deploy is Script {
         address treasury = vm.envAddress("TREASURY_ADDRESS");
 
         // 双色球日程：锚点取最近一个已过去的周二 12:00 UTC（北京时间 20:00 停售），
-        // 间隔循环 [2 天, 3 天, 2 天] → 周二/周四/周日（SPEC 第 9 节 Q2）
-        uint64 anchor = _lastTuesdayNoonUtc();
-        uint32[] memory intervals = new uint32[](3);
-        intervals[0] = 2 days;
-        intervals[1] = 3 days;
-        intervals[2] = 2 days;
+        // 间隔循环 [2 天, 3 天, 2 天] → 周二/周四/周日（SPEC 第 9 节 Q2）。
+        // 设置 FAST_INTERVAL_SECONDS（须 > 75 分钟封盘期，如 7200）可部署快节奏
+        // 验证实例，用于在数小时内跑通真实 VRF + Automation 全链路
+        uint64 anchor;
+        uint32[] memory intervals;
+        uint256 fastInterval = vm.envOr("FAST_INTERVAL_SECONDS", uint256(0));
+        if (fastInterval > 0) {
+            anchor = uint64(block.timestamp);
+            intervals = new uint32[](1);
+            intervals[0] = uint32(fastInterval);
+            console.log(unicode"!! 快节奏验证实例，间隔（秒）:", fastInterval);
+        } else {
+            anchor = _lastTuesdayNoonUtc();
+            intervals = new uint32[](3);
+            intervals[0] = 2 days;
+            intervals[1] = 3 days;
+            intervals[2] = 2 days;
+        }
 
         // 奖级：60% / 25%（2 名）/ 15%（5 名）（FR-C-13、Q5）
         uint16[] memory tierBps = new uint16[](3);
@@ -62,6 +74,18 @@ contract Deploy is Script {
             tierWinners
         );
         vm.stopBroadcast();
+
+        // 写前端配置（仅测试网；主网前端配置应人工审核后更新）
+        if (block.chainid == 84532) {
+            string memory json = "deployment";
+            vm.serializeUint(json, "chainId", block.chainid);
+            vm.serializeAddress(json, "lottery", address(lottery));
+            vm.serializeAddress(json, "usdc", cfg.usdc);
+            vm.serializeAddress(json, "vrfCoordinator", cfg.vrfCoordinator);
+            vm.serializeAddress(json, "treasury", treasury);
+            string memory out = vm.serializeString(json, "subId", vm.toString(subId));
+            vm.writeJson(out, "../web/src/lib/deployment.base-sepolia.json");
+        }
 
         // FR-D-02：部署后待办清单
         console.log("==============================================");

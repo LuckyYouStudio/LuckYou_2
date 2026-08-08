@@ -4,10 +4,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Address } from "viem";
 import {
   ANVIL_ACCOUNTS,
+  IS_LOCAL,
   addresses,
   advanceTime,
-  anvil,
+  chain,
+  connectInjected,
   erc20Abi,
+  expectedChainId,
+  injectedWalletFor,
   lotteryAbi,
   publicClient,
   vrfAbi,
@@ -62,7 +66,7 @@ function short(addr: string): string {
 }
 
 export default function Home() {
-  const [account, setAccount] = useState<Address>(ANVIL_ACCOUNTS[0].address);
+  const [account, setAccount] = useState<Address | null>(IS_LOCAL ? ANVIL_ACCOUNTS[0].address : null);
   const [chainNow, setChainNow] = useState<bigint>(0n);
   const [currentId, setCurrentId] = useState(0);
   const [rounds, setRounds] = useState<RoundInfo[]>([]);
@@ -89,7 +93,7 @@ export default function Home() {
     try {
       // FR-W-05 精神：写操作前校验链 ID，这里在轮询时持续校验
       const chainId = await publicClient.getChainId();
-      setWrongChain(chainId !== anvil.id);
+      setWrongChain(chainId !== chain.id);
 
       const block = await publicClient.getBlock();
       setChainNow(block.timestamp);
@@ -116,14 +120,16 @@ export default function Home() {
           functionName: "vrfRequestOf",
           args: [id],
         })) as readonly [bigint, bigint];
-        const myTickets = (await publicClient.readContract({
-          address: addresses.lottery,
-          abi: lotteryAbi,
-          functionName: "ticketsOwned",
-          args: [id, account],
-        })) as bigint;
+        const myTickets = account
+          ? ((await publicClient.readContract({
+              address: addresses.lottery,
+              abi: lotteryAbi,
+              functionName: "ticketsOwned",
+              args: [id, account],
+            })) as bigint)
+          : 0n;
         const myPending =
-          r[0] === 3
+          r[0] === 3 && account
             ? ([
                 ...((await publicClient.readContract({
                   address: addresses.lottery,
@@ -149,17 +155,21 @@ export default function Home() {
       }
       setRounds(infos);
 
-      const curRanges = (await publicClient.readContract({
-        address: addresses.lottery,
-        abi: lotteryAbi,
-        functionName: "getRanges",
-        args: [cur],
-      })) as readonly { start: number; end: number; owner: Address }[];
-      setMyRanges(
-        curRanges
-          .filter((r) => r.owner.toLowerCase() === account.toLowerCase())
-          .map((r) => ({ start: r.start, end: r.end })),
-      );
+      if (account) {
+        const curRanges = (await publicClient.readContract({
+          address: addresses.lottery,
+          abi: lotteryAbi,
+          functionName: "getRanges",
+          args: [cur],
+        })) as readonly { start: number; end: number; owner: Address }[];
+        setMyRanges(
+          curRanges
+            .filter((r) => r.owner.toLowerCase() === account.toLowerCase())
+            .map((r) => ({ start: r.start, end: r.end })),
+        );
+      } else {
+        setMyRanges([]);
+      }
 
       const settled = infos.filter((r) => r.state === 3);
       const winnersMap = new Map<number, { tickets: number[]; owners: Address[] }>();
@@ -175,20 +185,24 @@ export default function Home() {
       setWinners(winnersMap);
 
       setBalance(
-        (await publicClient.readContract({
-          address: addresses.usdc,
-          abi: erc20Abi,
-          functionName: "balanceOf",
-          args: [account],
-        })) as bigint,
+        account
+          ? ((await publicClient.readContract({
+              address: addresses.usdc,
+              abi: erc20Abi,
+              functionName: "balanceOf",
+              args: [account],
+            })) as bigint)
+          : 0n,
       );
       setAllowance(
-        (await publicClient.readContract({
-          address: addresses.usdc,
-          abi: erc20Abi,
-          functionName: "allowance",
-          args: [account, addresses.lottery],
-        })) as bigint,
+        account
+          ? ((await publicClient.readContract({
+              address: addresses.usdc,
+              abi: erc20Abi,
+              functionName: "allowance",
+              args: [account, addresses.lottery],
+            })) as bigint)
+          : 0n,
       );
       setFees(
         (await publicClient.readContract({
@@ -249,12 +263,14 @@ export default function Home() {
 
   const write = useCallback(
     async (address: Address, abi: typeof lotteryAbi, functionName: string, args: unknown[]) => {
-      const hash = await walletFor(account).writeContract({
+      if (!account) throw new Error("请先连接钱包");
+      const client = IS_LOCAL ? walletFor(account) : injectedWalletFor(account);
+      const hash = await client.writeContract({
         address,
         abi,
         functionName,
         args,
-        chain: anvil,
+        chain,
         account,
       });
       await publicClient.waitForTransactionReceipt({ hash });
@@ -293,7 +309,8 @@ export default function Home() {
         <span>LuckYou</span> 本地测试台
       </h1>
       <p className="subtitle">
-        anvil (chainId 31337) · Lottery <span className="addr">{addresses.lottery}</span> · 票价 1 USDC · 抽成 1% ·{" "}
+        {chain.name} (chainId {expectedChainId}) · Lottery <span className="addr">{addresses.lottery}</span> · 票价 1
+        USDC · 抽成 1% ·{" "}
         <a href="/history" style={{ color: "var(--blue)" }}>
           我的记录 →
         </a>
@@ -368,17 +385,46 @@ export default function Home() {
         </section>
 
         <section className="card">
-          <h2>购票（{ANVIL_ACCOUNTS.find((a) => a.address === account)?.name}）</h2>
-          <div className="row">
-            <span className="k">切换账户</span>
-            <select value={account} onChange={(e) => setAccount(e.target.value as Address)}>
-              {ANVIL_ACCOUNTS.map((a) => (
-                <option key={a.address} value={a.address}>
-                  {a.name} {short(a.address)}
-                </option>
-              ))}
-            </select>
-          </div>
+          <h2>
+            购票
+            {account
+              ? `（${IS_LOCAL ? ANVIL_ACCOUNTS.find((a) => a.address === account)?.name : short(account)}）`
+              : ""}
+          </h2>
+          {IS_LOCAL ? (
+            <div className="row">
+              <span className="k">切换账户</span>
+              <select value={account ?? ""} onChange={(e) => setAccount(e.target.value as Address)}>
+                {ANVIL_ACCOUNTS.map((a) => (
+                  <option key={a.address} value={a.address}>
+                    {a.name} {short(a.address)}
+                  </option>
+                ))}
+              </select>
+            </div>
+          ) : (
+            <div className="row">
+              <span className="k">钱包</span>
+              <span className="v">
+                {account ? (
+                  <span className="addr">{account}</span>
+                ) : (
+                  <button
+                    className="btn primary"
+                    disabled={busy !== null}
+                    onClick={() =>
+                      act("连接钱包", async () => {
+                        const a = await connectInjected();
+                        setAccount(a);
+                      })
+                    }
+                  >
+                    🔗 连接 MetaMask
+                  </button>
+                )}
+              </span>
+            </div>
+          )}
           <div className="row">
             <span className="k">USDC 余额</span>
             <span className="v">{fmt6(balance)}</span>
@@ -406,13 +452,17 @@ export default function Home() {
             </button>
           </div>
           <div style={{ marginTop: 8 }}>
-            <button
-              className="btn"
-              disabled={busy !== null}
-              onClick={() => act("领取 10000 测试 USDC", () => write(addresses.usdc, erc20Abi, "mint", [account, 10_000_000_000n]))}
-            >
-              💧 领测试币
-            </button>
+            {IS_LOCAL && (
+              <button
+                className="btn"
+                disabled={busy !== null}
+                onClick={() =>
+                  act("领取 10000 测试 USDC", () => write(addresses.usdc, erc20Abi, "mint", [account, 10_000_000_000n]))
+                }
+              >
+                💧 领测试币
+              </button>
+            )}
             <input value={injectAmt} onChange={(e) => setInjectAmt(e.target.value)} placeholder="注资额" />
             <button
               className="btn"
@@ -433,58 +483,78 @@ export default function Home() {
         </section>
 
         <section className="card">
-          <h2>时间与开奖控制（anvil 专用）</h2>
+          <h2>{IS_LOCAL ? "时间与开奖控制（anvil 专用）" : "开奖控制"}</h2>
           <div className="row">
             <span className="k">链上时间</span>
             <span className="v">{fmtTs(chainNow)}</span>
           </div>
-          <div style={{ marginTop: 8 }}>
-            <button
-              className="btn"
-              disabled={busy !== null || !current || chainNow >= current.closeTime}
-              onClick={() => act("快进到停售（封盘）", () => advanceTime(Number(current!.closeTime - chainNow) + 1))}
-            >
-              ⏩ 快进到停售
-            </button>
-            <button
-              className="btn"
-              disabled={busy !== null || !current || chainNow >= current.drawTime}
-              onClick={() => act("快进到开奖时刻", () => advanceTime(Number(current!.drawTime - chainNow) + 1))}
-            >
-              ⏩ 快进到开奖
-            </button>
-            <button className="btn" disabled={busy !== null} onClick={() => act("快进 1 天", () => advanceTime(86400))}>
-              +1 天
-            </button>
-            <button className="btn" disabled={busy !== null} onClick={() => act("快进 91 天（过领奖期）", () => advanceTime(91 * 86400))}>
-              +91 天
-            </button>
-          </div>
+          {IS_LOCAL && (
+            <div style={{ marginTop: 8 }}>
+              <button
+                className="btn"
+                disabled={busy !== null || !current || chainNow >= current.closeTime}
+                onClick={() => act("快进到停售（封盘）", () => advanceTime(Number(current!.closeTime - chainNow) + 1))}
+              >
+                ⏩ 快进到停售
+              </button>
+              <button
+                className="btn"
+                disabled={busy !== null || !current || chainNow >= current.drawTime}
+                onClick={() => act("快进到开奖时刻", () => advanceTime(Number(current!.drawTime - chainNow) + 1))}
+              >
+                ⏩ 快进到开奖
+              </button>
+              <button className="btn" disabled={busy !== null} onClick={() => act("快进 1 天", () => advanceTime(86400))}>
+                +1 天
+              </button>
+              <button
+                className="btn"
+                disabled={busy !== null}
+                onClick={() => act("快进 91 天（过领奖期）", () => advanceTime(91 * 86400))}
+              >
+                +91 天
+              </button>
+            </div>
+          )}
           <div style={{ marginTop: 8 }}>
             <button
               className="btn warn"
               disabled={busy !== null || !current || current.state !== 1 || chainNow < current.drawTime}
               onClick={() => act("触发开奖 performUpkeep", () => write(addresses.lottery, lotteryAbi, "performUpkeep", ["0x"]))}
             >
-              🎰 触发开奖（模拟 keeper）
+              🎰 触发开奖{IS_LOCAL ? "（模拟 keeper）" : "（keeper 兜底）"}
             </button>
-            {drawingRounds.map((r) => (
-              <button
-                key={r.id}
-                className="btn warn"
-                disabled={busy !== null}
-                onClick={() =>
-                  act(`模拟 VRF 回调（第 ${r.id} 期）`, () =>
-                    write(addresses.vrfCoordinator, vrfAbi, "fulfillRandomWords", [r.vrfRequestId, addresses.lottery]),
-                  )
-                }
-              >
-                🎲 VRF 回调开出第 {r.id} 期
-              </button>
-            ))}
+            {IS_LOCAL &&
+              drawingRounds.map((r) => (
+                <button
+                  key={r.id}
+                  className="btn warn"
+                  disabled={busy !== null}
+                  onClick={() =>
+                    act(`模拟 VRF 回调（第 ${r.id} 期）`, () =>
+                      write(addresses.vrfCoordinator, vrfAbi, "fulfillRandomWords", [r.vrfRequestId, addresses.lottery]),
+                    )
+                  }
+                >
+                  🎲 VRF 回调开出第 {r.id} 期
+                </button>
+              ))}
+            {!IS_LOCAL &&
+              drawingRounds.map((r) => (
+                <button
+                  key={r.id}
+                  className="btn warn"
+                  disabled={busy !== null}
+                  onClick={() => act(`重试第 ${r.id} 期 VRF`, () => write(addresses.lottery, lotteryAbi, "retryDraw", [r.id]))}
+                >
+                  🔁 重试第 {r.id} 期 VRF（超时 3 小时后可用）
+                </button>
+              ))}
           </div>
           <p style={{ color: "var(--muted)", marginTop: 8, fontSize: 12 }}>
-            本地没有 Chainlink 节点：keeper 与 VRF 回调都用按钮手动模拟。测试网/主网由 Automation 与 VRF 自动完成。
+            {IS_LOCAL
+              ? "本地没有 Chainlink 节点：keeper 与 VRF 回调都用按钮手动模拟。测试网/主网由 Automation 与 VRF 自动完成。"
+              : "测试网由 Chainlink Automation 自动开奖、VRF 自动回调；上面的按钮仅作 keeper 未执行时的手动兜底。"}
           </p>
         </section>
 
@@ -521,7 +591,7 @@ export default function Home() {
         </section>
 
         <section className="card">
-          <h2>运营（owner = 账户 #0）</h2>
+          <h2>运营（owner = {IS_LOCAL ? "账户 #0" : "部署者"}）</h2>
           <div className="row">
             <span className="k">累计抽成</span>
             <span className="v">{fmt6(fees)}</span>
@@ -551,7 +621,8 @@ export default function Home() {
             </button>
           </div>
           <p style={{ color: "var(--muted)", marginTop: 8, fontSize: 12 }}>
-            owner 操作需切到账户 #0。暂停只影响购票，领奖不受影响（FR-C-23）。
+            {IS_LOCAL ? "owner 操作需切到账户 #0。" : "owner 操作需用部署者钱包。"}
+            暂停只影响购票，领奖不受影响（FR-C-23）。
           </p>
         </section>
 
