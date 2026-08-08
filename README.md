@@ -77,8 +77,10 @@ forge script script/Deploy.s.sol --rpc-url $BASE_SEPOLIA_RPC_URL \
   --private-key $PRIVATE_KEY --broadcast --verify
 ```
 
-部署脚本会打印待办清单：到 [vrf.chain.link](https://vrf.chain.link) 给订阅加 consumer 并充 LINK，
-到 [automation.chain.link](https://automation.chain.link) 注册 Custom logic upkeep。
+部署脚本会打印待办清单：到 [vrf.chain.link](https://vrf.chain.link) 给订阅加 consumer 并充 LINK。
+开奖触发（keeper）：Chainlink Automation 已于 2026 年中弃用（替代品为 CRE），
+测试阶段用自托管轮询 keeper（每分钟 `checkUpkeep`，为真则 `performUpkeep`），
+主网前迁移到 CRE 定时工作流。keeper 不在信任边界内，任何人可触发开奖与重试。
 链上参数（VRF coordinator / keyHash / USDC）已按 chainid 写入脚本，
 来源：[Chainlink VRF v2.5 支持网络](https://docs.chain.link/vrf/v2-5/supported-networks)、
 [Circle USDC 官方地址](https://developers.circle.com/stablecoins/usdc-contract-addresses)。

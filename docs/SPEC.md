@@ -262,3 +262,8 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   （见 FR-C-26），用于运营方做大奖池和活动派奖
 - **Q7（项目定位，2026-08-07）**：测试网先行完整验证；是否上主网取决于
   合规评估（牌照、运营主体所在司法辖区）结果
+- **Q8（keeper 方案，2026-08-08）**：Chainlink Automation 已被官方弃用
+  （测试网 2026-06-24 停服，主网 2026-07-31，替代品为 CRE）。合约的
+  checkUpkeep/performUpkeep 接口不变——keeper 本就不在信任边界内
+  （performUpkeep/retryDraw 任何人可调，随机数安全仅依赖 VRF）。
+  测试阶段用自托管轮询 keeper 触发开奖；主网前迁移到 CRE 定时工作流
