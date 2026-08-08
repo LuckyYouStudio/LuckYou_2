@@ -44,6 +44,8 @@ export const addresses = {
 } as const;
 
 export const expectedChainId = deployment.chainId;
+/** 合约部署块：事件扫描的起点（从 0 扫会在公共测试网上产生数千次请求） */
+export const startBlock = BigInt((deployment as { startBlock?: number }).startBlock ?? 0);
 
 const rpcUrl = process.env.NEXT_PUBLIC_RPC_URL ?? chain.rpcUrls.default.http[0];
 

@@ -6,7 +6,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { isAddress, parseAbiItem, type Address } from "viem";
-import { ANVIL_ACCOUNTS, IS_LOCAL, addresses, publicClient } from "@/lib/contracts";
+import { ANVIL_ACCOUNTS, IS_LOCAL, addresses, publicClient, startBlock } from "@/lib/contracts";
 
 const TICKETS_BOUGHT = parseAbiItem(
   "event TicketsBought(uint32 indexed roundId, address indexed buyer, uint32 start, uint32 quantity)",
@@ -55,8 +55,8 @@ export default function History() {
       const latest = await publicClient.getBlockNumber();
       const buyRecords: BuyRecord[] = [];
       const claimRecords: ClaimRecord[] = [];
-      // 分段扫描全部区块（FR-W-03：仅靠事件重建历史）
-      for (let from = 0n; from <= latest; from += BLOCK_CHUNK + 1n) {
+      // 从合约部署块起分段扫描（FR-W-03：仅靠事件重建历史）
+      for (let from = startBlock; from <= latest; from += BLOCK_CHUNK + 1n) {
         const to = from + BLOCK_CHUNK > latest ? latest : from + BLOCK_CHUNK;
         const bought = await publicClient.getLogs({
           address: addresses.lottery,

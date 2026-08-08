@@ -79,6 +79,7 @@ contract Deploy is Script {
         if (block.chainid == 84532) {
             string memory json = "deployment";
             vm.serializeUint(json, "chainId", block.chainid);
+            vm.serializeUint(json, "startBlock", block.number);
             vm.serializeAddress(json, "lottery", address(lottery));
             vm.serializeAddress(json, "usdc", cfg.usdc);
             vm.serializeAddress(json, "vrfCoordinator", cfg.vrfCoordinator);

@@ -31,6 +31,7 @@ contract DeployLocal is Script {
 
         string memory json = "deployment";
         vm.serializeUint(json, "chainId", block.chainid);
+        vm.serializeUint(json, "startBlock", block.number);
         vm.serializeAddress(json, "lottery", address(lottery));
         vm.serializeAddress(json, "usdc", address(testbed.usdc()));
         vm.serializeAddress(json, "vrfCoordinator", address(testbed.coordinator()));
