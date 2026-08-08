@@ -66,6 +66,7 @@ export default function Home() {
   const [chainNow, setChainNow] = useState<bigint>(0n);
   const [currentId, setCurrentId] = useState(0);
   const [rounds, setRounds] = useState<RoundInfo[]>([]);
+  const [myRanges, setMyRanges] = useState<{ start: number; end: number }[]>([]);
   const [balance, setBalance] = useState<bigint>(0n);
   const [allowance, setAllowance] = useState<bigint>(0n);
   const [fees, setFees] = useState<bigint>(0n);
@@ -147,6 +148,18 @@ export default function Home() {
         });
       }
       setRounds(infos);
+
+      const curRanges = (await publicClient.readContract({
+        address: addresses.lottery,
+        abi: lotteryAbi,
+        functionName: "getRanges",
+        args: [cur],
+      })) as readonly { start: number; end: number; owner: Address }[];
+      setMyRanges(
+        curRanges
+          .filter((r) => r.owner.toLowerCase() === account.toLowerCase())
+          .map((r) => ({ start: r.start, end: r.end })),
+      );
 
       const settled = infos.filter((r) => r.state === 3);
       const winnersMap = new Map<number, { tickets: number[]; owners: Address[] }>();
@@ -338,6 +351,16 @@ export default function Home() {
                 <span className="k">我的持票</span>
                 <span className="v">{current.myTickets.toString()} 张</span>
               </div>
+              {myRanges.length > 0 && (
+                <div className="row">
+                  <span className="k">我的票号</span>
+                  <span className="v">
+                    {myRanges
+                      .map((r) => (r.end - r.start === 1 ? `#${r.start}` : `#${r.start}~${r.end - 1}`))
+                      .join("，")}
+                  </span>
+                </div>
+              )}
             </>
           ) : (
             <p>加载中…</p>
