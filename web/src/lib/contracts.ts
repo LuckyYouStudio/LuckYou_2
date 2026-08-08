@@ -67,12 +67,53 @@ export function walletFor(account: Address) {
   return createWalletClient({ chain, transport: http(rpcUrl), account });
 }
 
-/** 测试网模式：连接注入钱包（MetaMask 等），并确保切到目标链（FR-W-05） */
-export async function connectInjected(): Promise<Address> {
-  const provider = window.ethereum;
-  if (!provider) {
-    throw new Error("未检测到浏览器钱包（请安装 MetaMask）");
+// ===== EIP-6963 多钱包发现 =====
+// 浏览器装多个钱包插件时 window.ethereum 会被抢注，必须用 6963 协议点名 MetaMask
+
+interface Eip6963ProviderDetail {
+  info: { uuid: string; name: string; rdns: string };
+  provider: EIP1193Provider;
+}
+
+let selectedProvider: EIP1193Provider | null = null;
+export let selectedWalletName = "";
+
+function discoverProviders(timeoutMs = 400): Promise<Eip6963ProviderDetail[]> {
+  return new Promise((resolve) => {
+    const found: Eip6963ProviderDetail[] = [];
+    const handler = (e: Event) => {
+      found.push((e as CustomEvent<Eip6963ProviderDetail>).detail);
+    };
+    window.addEventListener("eip6963:announceProvider", handler);
+    window.dispatchEvent(new Event("eip6963:requestProvider"));
+    setTimeout(() => {
+      window.removeEventListener("eip6963:announceProvider", handler);
+      resolve(found);
+    }, timeoutMs);
+  });
+}
+
+async function getInjectedProvider(): Promise<EIP1193Provider> {
+  if (selectedProvider) return selectedProvider;
+  const providers = await discoverProviders();
+  const metamask = providers.find((p) => p.info.rdns === "io.metamask");
+  const picked = metamask ?? providers[0];
+  if (picked) {
+    selectedProvider = picked.provider;
+    selectedWalletName = picked.info.name;
+    return picked.provider;
   }
+  if (window.ethereum) {
+    selectedProvider = window.ethereum;
+    selectedWalletName = "window.ethereum";
+    return window.ethereum;
+  }
+  throw new Error("未检测到浏览器钱包（请安装 MetaMask）");
+}
+
+/** 测试网模式：连接注入钱包（优先 MetaMask），并确保切到目标链（FR-W-05） */
+export async function connectInjected(): Promise<Address> {
+  const provider = await getInjectedProvider();
   const accounts = (await provider.request({ method: "eth_requestAccounts" })) as Address[];
   const chainIdHex = (await provider.request({ method: "eth_chainId" })) as string;
   if (parseInt(chainIdHex, 16) !== chain.id) {
@@ -99,11 +140,11 @@ export async function connectInjected(): Promise<Address> {
   return accounts[0];
 }
 
-/** 测试网模式：通过注入钱包签名 */
+/** 测试网模式：通过已选定的注入钱包签名 */
 export function injectedWalletFor(account: Address) {
-  const provider = window.ethereum;
+  const provider = selectedProvider ?? window.ethereum;
   if (!provider) {
-    throw new Error("未检测到浏览器钱包");
+    throw new Error("未检测到浏览器钱包，请先点击连接");
   }
   return createWalletClient({ chain, transport: custom(provider), account });
 }

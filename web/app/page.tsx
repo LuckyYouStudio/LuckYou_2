@@ -10,6 +10,7 @@ import {
   chain,
   connectInjected,
   erc20Abi,
+  selectedWalletName,
   expectedChainId,
   injectedWalletFor,
   lotteryAbi,
@@ -416,6 +417,7 @@ export default function Home() {
                       act("连接钱包", async () => {
                         const a = await connectInjected();
                         setAccount(a);
+                        log("info", `已选用钱包：${selectedWalletName}，地址 ${short(a)}`);
                       })
                     }
                   >
