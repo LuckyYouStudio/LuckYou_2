@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Address } from "viem";
 import {
   ANVIL_ACCOUNTS,
@@ -79,6 +79,7 @@ export default function Home() {
   const [paused, setPaused] = useState(false);
   const [tierWinners, setTierWinners] = useState<number[]>([1, 2, 5]);
   const [winners, setWinners] = useState<Map<number, { tickets: number[]; owners: Address[] }>>(new Map());
+  const winnersCache = useRef(new Map<number, { tickets: number[]; owners: Address[] }>());
   const [qty, setQty] = useState("10");
   const [injectAmt, setInjectAmt] = useState("100");
   const [busy, setBusy] = useState<string | null>(null);
@@ -115,12 +116,16 @@ export default function Home() {
           functionName: "getRound",
           args: [id],
         })) as readonly [number, bigint, bigint, number, bigint, bigint, bigint, number, boolean];
-        const [req] = (await publicClient.readContract({
-          address: addresses.lottery,
-          abi: lotteryAbi,
-          functionName: "vrfRequestOf",
-          args: [id],
-        })) as readonly [bigint, bigint];
+        // 只有 DRAWING 状态才需要 requestId（本地模拟回调/测试网重试用）
+        const [req] =
+          r[0] === 2
+            ? ((await publicClient.readContract({
+                address: addresses.lottery,
+                abi: lotteryAbi,
+                functionName: "vrfRequestOf",
+                args: [id],
+              })) as readonly [bigint, bigint])
+            : ([0n, 0n] as const);
         const myTickets = account
           ? ((await publicClient.readContract({
               address: addresses.lottery,
@@ -172,18 +177,19 @@ export default function Home() {
         setMyRanges([]);
       }
 
+      // 已结算期的开奖结果不可变，只拉一次并缓存，减轻公共 RPC 压力
       const settled = infos.filter((r) => r.state === 3);
-      const winnersMap = new Map<number, { tickets: number[]; owners: Address[] }>();
       for (const r of settled) {
+        if (winnersCache.current.has(r.id)) continue;
         const [tickets, owners] = (await publicClient.readContract({
           address: addresses.lottery,
           abi: lotteryAbi,
           functionName: "winnersOf",
           args: [r.id],
         })) as readonly [readonly number[], readonly Address[]];
-        winnersMap.set(r.id, { tickets: [...tickets], owners: [...owners] });
+        winnersCache.current.set(r.id, { tickets: [...tickets], owners: [...owners] });
       }
-      setWinners(winnersMap);
+      setWinners(new Map([...winnersCache.current].filter(([id]) => settled.some((r) => r.id === id))));
 
       setBalance(
         account
@@ -240,7 +246,8 @@ export default function Home() {
 
   useEffect(() => {
     refresh();
-    const t = setInterval(refresh, 3000);
+    // 本地链无限流可以快轮询；公共测试网 RPC 放缓到 10 秒
+    const t = setInterval(refresh, IS_LOCAL ? 3000 : 10000);
     return () => clearInterval(t);
   }, [refresh]);
 

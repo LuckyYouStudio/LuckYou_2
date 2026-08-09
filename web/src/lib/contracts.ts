@@ -49,7 +49,13 @@ export const startBlock = BigInt((deployment as { startBlock?: number }).startBl
 
 const rpcUrl = process.env.NEXT_PUBLIC_RPC_URL ?? chain.rpcUrls.default.http[0];
 
-export const publicClient = createPublicClient({ chain, transport: http(rpcUrl) });
+// 测试网启用 multicall 聚合：把同一轮刷新的几十个 eth_call 合并成 1~2 个请求，
+// 避免公共 RPC 限流。本地 anvil 未部署 Multicall3，保持直连
+export const publicClient = createPublicClient({
+  chain,
+  transport: http(rpcUrl),
+  batch: IS_LOCAL ? undefined : { multicall: { wait: 50 } },
+});
 
 // anvil 默认解锁账户（公开的测试账户，仅本地使用）
 export const ANVIL_ACCOUNTS: { name: string; address: Address }[] = [
