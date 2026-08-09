@@ -98,7 +98,9 @@ contract Deploy is Script {
         console.log(unicode"  1. 在 https://vrf.chain.link 打开订阅", subId);
         console.log(unicode"     -> Add consumer:", address(lottery));
         console.log(unicode"     -> 确保订阅有足够 LINK 余额（建议 >= 5 LINK）");
-        console.log(unicode"  2. 启动 keeper（Chainlink Automation 已弃用，用自托管轮询");
+        console.log(
+            unicode"  2. 启动 keeper（Chainlink Automation 已弃用，用自托管轮询"
+        );
         console.log(unicode"     或 CRE 工作流）：checkUpkeep 为真时调用 performUpkeep");
         console.log(unicode"     -> Target contract:", address(lottery));
         console.log(unicode"  3. 运行 web/scripts/sync-abi.mjs 并更新前端 deployment 配置");

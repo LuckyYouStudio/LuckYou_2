@@ -32,7 +32,9 @@ contract LotteryKeeperReceiverTest is LotteryTestBase {
         vm.warp(_drawTimeOf(1));
 
         vm.expectRevert(
-            abi.encodeWithSelector(ReceiverTemplate.InvalidSender.selector, address(this), forwarder)
+            abi.encodeWithSelector(
+                ReceiverTemplate.InvalidSender.selector, address(this), forwarder
+            )
         );
         receiver.onReport("", abi.encode(true));
     }

@@ -174,6 +174,17 @@ contract LotteryEdgeTest is LotteryTestBase {
         lottery.injectPot(1, 0);
     }
 
+    /// @dev 审计 #5：注资与购票共用同一时间闸，封盘后不得再改变本期奖池规模
+    function test_RevertWhen_InjectAfterCloseTime() public {
+        token.mint(alice, 10e6);
+        vm.startPrank(alice);
+        token.approve(address(lottery), 10e6);
+        vm.warp(_closeTimeOf(1)); // 封盘期：state 仍是 OPEN，但已停售
+        vm.expectRevert(Lottery.SalesClosed.selector);
+        lottery.injectPot(1, 10e6);
+        vm.stopPrank();
+    }
+
     function test_RevertWhen_WinnersOfUnsettled() public {
         vm.expectRevert(Lottery.RoundNotSettled.selector);
         lottery.winnersOf(1);

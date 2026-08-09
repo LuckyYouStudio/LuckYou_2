@@ -8,11 +8,9 @@ pragma solidity >=0.4.16;
  * https://eips.ethereum.org/EIPS/eip-165[ERC].
  */
 interface IERC165 {
-  /**
-   * @dev Returns true if this contract implements the interface defined by
-   * `interfaceId`.
-   */
-  function supportsInterface(
-    bytes4 interfaceId
-  ) external view returns (bool);
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
 }

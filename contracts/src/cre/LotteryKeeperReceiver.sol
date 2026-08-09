@@ -14,6 +14,7 @@ interface ILotteryUpkeep {
 ///         桥接器不引入新的权限面。
 contract LotteryKeeperReceiver is ReceiverTemplate {
     error ExecutionNotRequested();
+    error InvalidLotteryAddress();
 
     event UpkeepForwarded(address indexed lottery, uint256 timestamp);
 
@@ -22,6 +23,7 @@ contract LotteryKeeperReceiver is ReceiverTemplate {
     /// @param forwarder 本链的 CRE KeystoneForwarder 地址
     /// @param lottery 彩票合约地址
     constructor(address forwarder, address lottery) ReceiverTemplate(forwarder) {
+        if (lottery == address(0)) revert InvalidLotteryAddress();
         i_lottery = ILotteryUpkeep(lottery);
     }
 

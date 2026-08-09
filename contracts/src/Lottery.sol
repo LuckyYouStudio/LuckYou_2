@@ -6,6 +6,9 @@ import {
 } from "@chainlink/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
 import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
 import {
+    IVRFCoordinatorV2Plus
+} from "@chainlink/contracts/src/v0.8/vrf/dev/interfaces/IVRFCoordinatorV2Plus.sol";
+import {
     AutomationCompatibleInterface
 } from "@chainlink/contracts/src/v0.8/automation/interfaces/AutomationCompatibleInterface.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -14,8 +17,16 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 
 /// @title 链上周期开奖彩票
 /// @notice 抽签制彩票：按双色球日程（锚定固定场次）售票，Chainlink VRF v2.5 开奖，
-///         Automation 触发。奖池与运营抽成自购票时刻起分账（FR-C-20），
+///         keeper 触发。奖池与运营抽成自购票时刻起分账（FR-C-20），
 ///         不存在任何能挪用奖池的管理员函数（FR-C-24）。
+/// @dev 计价 token 必须是标准 ERC20：**不支持**转账扣费（fee-on-transfer）或
+///      弹性供给（rebasing）代币——这两类会使名义记账与实际到账不符，
+///      击穿「合约余额 >= 全部未领奖金」的偿付性不变量。
+/// @dev owner 权限完整清单见 FR-C-22 说明：setTreasury / setFeeBps / setSalesPaused，
+///      外加继承自 ConfirmedOwner 的 transferOwnership / acceptOwnership，
+///      以及继承自 VRFConsumerBaseV2Plus 的 setCoordinator（无法 override 封禁，
+///      但换源后回调会被 CoordinatorTampered 拒绝，只能造成可自行恢复的延迟，
+///      无法操纵开奖或挪用资金）。
 contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -76,6 +87,7 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     error InvalidSchedule();
     error InvalidTierConfig();
     error NoFeesToWithdraw();
+    error CoordinatorTampered();
 
     // ===== 事件（FR-C-25）=====
 
@@ -111,12 +123,15 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     uint256 public immutable i_ticketPrice;
     bytes32 public immutable i_keyHash;
     uint256 public immutable i_subId;
+    /// @dev 构造时钉死的随机源。基类 VRFConsumerBaseV2Plus 暴露了 owner 可调且
+    ///      非 virtual（无法 override）的 setCoordinator——若不钉死，owner 可把随机源
+    ///      换成自控合约、离线挑选种子稳中头奖。请求只发往此地址，回调也只认此地址
+    address private immutable i_coordinator;
 
     // ===== 存储 =====
 
     uint16[] private s_tierBps; // 各奖级比例，和为 10000（FR-C-13）
     uint8[] private s_tierWinnerCounts; // 各奖级名额
-    uint8 private s_totalSlots; // 名额总数（≤ 16）
 
     uint32[] private s_intervals; // 场次间隔循环（如 [2d, 3d, 2d]）
     uint64 private s_lastSlotTime; // 最近一个已使用的场次时间
@@ -184,11 +199,11 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         i_ticketPrice = ticketPrice;
         i_keyHash = keyHash;
         i_subId = subId;
+        i_coordinator = vrfCoordinator;
         s_treasury = treasury;
         s_feeBps = feeBps;
         s_tierBps = tierBps;
         s_tierWinnerCounts = tierWinnerCounts;
-        s_totalSlots = uint8(slots);
         s_intervals = intervals;
         s_lastSlotTime = anchorTime;
 
@@ -223,10 +238,12 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         i_token.safeTransferFrom(msg.sender, address(this), cost);
     }
 
-    /// @notice 冷启动/活动注资：任何人可向 OPEN 状态的期注入奖金，全额进奖池、不抽成（FR-C-26）
+    /// @notice 冷启动/活动注资：任何人可向售票中的期注入奖金，全额进奖池、不抽成（FR-C-26）
+    /// @dev 与 buyTickets 共用同一时间闸（FR-C-09）：停售后不得再改变本期奖池规模
     function injectPot(uint32 roundId, uint256 amount) external {
         Round storage r = s_rounds[roundId];
         if (r.state != RoundState.OPEN) revert RoundNotOpen();
+        if (block.timestamp >= r.closeTime) revert SalesClosed();
         if (amount == 0) revert InvalidQuantity();
         r.pot += amount;
         emit PotInjected(roundId, msg.sender, amount);
@@ -299,6 +316,11 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         internal
         override
     {
+        // 基类只校验 msg.sender == s_vrfCoordinator，而 s_vrfCoordinator 可被 owner
+        // 用继承来的 setCoordinator 换掉。此处强制随机源必须是构造时钉死的那一个，
+        // 杜绝 owner 换源后离线挑选种子操纵开奖（FR-C-11/22/24 的实际保障）
+        if (address(s_vrfCoordinator) != i_coordinator) revert CoordinatorTampered();
+
         uint32 roundId = s_requestToRound[requestId];
         Round storage r = s_rounds[roundId];
         if (r.state != RoundState.DRAWING || r.vrfRequestId != requestId) {
@@ -568,9 +590,11 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         emit RoundOpened(newId, t);
     }
 
+    /// @dev 请求恒发往构造时钉死的 coordinator，不受 setCoordinator 影响
     function _requestRandomWords() private returns (uint256 requestId) {
-        return s_vrfCoordinator.requestRandomWords(
-            VRFV2PlusClient.RandomWordsRequest({
+        return IVRFCoordinatorV2Plus(i_coordinator)
+            .requestRandomWords(
+                VRFV2PlusClient.RandomWordsRequest({
                 keyHash: i_keyHash,
                 subId: i_subId,
                 requestConfirmations: VRF_CONFIRMATIONS,
@@ -580,7 +604,7 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
                     VRFV2PlusClient.ExtraArgsV1({nativePayment: false})
                 )
             })
-        );
+            );
     }
 
     /// @dev FR-C-12：slot i 的中奖票号 = keccak256(seed, i) % ticketCount。

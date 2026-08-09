@@ -68,7 +68,9 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
 
 - **FR-C-01** 奖池资产 **MUST** 使用 ERC20（部署时通过构造参数注入 token 地址），
   默认 USDC。**MUST NOT** 硬编码 6 位小数——所有金额按 token 原生精度处理，
-  票价由构造参数给出。部署默认票价 = 1 个计价 token（USDC 即 1e6，
+  票价由构造参数给出。计价 token **MUST** 是标准 ERC20：**MUST NOT** 使用
+  转账扣费（fee-on-transfer）或弹性供给（rebasing）代币——名义记账与实际到账不符
+  会击穿偿付性不变量（2026-08-09 安全自查 #4）。部署默认票价 = 1 个计价 token（USDC 即 1e6，
   Deploy 脚本按 decimals 换算，2026-08-07 定）。
   - 验收：用 6 decimals 和 18 decimals 两种 mock token 分别跑全套测试均通过
 - **FR-C-02** 所有 ERC20 交互 **MUST** 使用 OpenZeppelin `SafeERC20`
@@ -151,7 +153,14 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
 
 ### 4.6 权限与暂停
 
-- **FR-C-22** owner 权限仅限：设置 treasury、设置 feeBps（≤上限）、暂停售票
+- **FR-C-22** owner 的**业务**权限仅限：设置 treasury、设置 feeBps（≤上限）、暂停售票。
+  另有两类**继承而来、无法封禁**的权限，2026-08-09 安全自查后在此显式披露：
+  - `transferOwnership` / `acceptOwnership`（来自 ConfirmedOwner）
+  - `setCoordinator`（来自 VRFConsumerBaseV2Plus，非 virtual 无法 override）。
+    合约已把 coordinator 钉死为 immutable：请求恒发往钉死地址，回调强制校验
+    随机源未被替换（`CoordinatorTampered`）。**owner 换源无法操纵开奖或挪用资金**，
+    最坏只能造成可自行恢复的结算延迟
+  - 验收：`test/LotteryVrfHijack.t.sol` 证明劫持随机源后回调被拒、奖池分文未动
 - **FR-C-23** `setSalesPaused(true)` **MUST** 只影响 `buyTickets`。
   `claim` / `rolloverExpired` / `retryDraw` **MUST** 不受影响
   - 验收：暂停状态下中奖者仍能成功领奖
