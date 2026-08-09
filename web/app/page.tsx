@@ -314,7 +314,7 @@ export default function Home() {
   return (
     <main>
       <h1>
-        <span>LuckYou</span> 本地测试台
+        <span>LuckYou</span> {IS_LOCAL ? "本地测试台" : "Base Sepolia 测试站"}
       </h1>
       <p className="subtitle">
         {chain.name} (chainId {expectedChainId}) · Lottery <span className="addr">{addresses.lottery}</span> · 票价 1
@@ -563,7 +563,7 @@ export default function Home() {
           <p style={{ color: "var(--muted)", marginTop: 8, fontSize: 12 }}>
             {IS_LOCAL
               ? "本地没有 Chainlink 节点：keeper 与 VRF 回调都用按钮手动模拟。测试网/主网由 Automation 与 VRF 自动完成。"
-              : "测试网由 Chainlink Automation 自动开奖、VRF 自动回调；上面的按钮仅作 keeper 未执行时的手动兜底。"}
+              : "测试网开奖由 keeper 自动触发（CRE 工作流迁移中）、Chainlink VRF 自动回调；上面的按钮仅作 keeper 未执行时的手动兜底，任何人可点。"}
           </p>
         </section>
 
