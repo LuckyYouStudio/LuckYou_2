@@ -141,13 +141,13 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     ///         抽签制彩票的固有性质，攻击者的本金也会随中奖回到自己手里。
     ///         配比只抬高资本门槛并给其他参与者稀释的机会
     uint256 public constant CARRY_MATCH_MULTIPLIER = 1;
-    /// @notice 释放缓冲所要求的「售票窗口完整度」下限（百分比）。
-    ///         `performUpkeep` 无权限、开期时刻由调用者选，攻击者可故意拖到临近下一场次
-    ///         才开期，使新期只剩最短窗口，再在同一笔交易里买光——第三、四轮的多项修复
-    ///         都是被这条路径在单笔交易内绕开的（审计第四轮结构性发现）。
-    ///         要求实际窗口达到名义窗口的此比例，缓冲才随新期释放；否则继续留在缓冲，
-    ///         等一个由及时 keeper 开出的、拥有完整窗口的期
-    uint256 public constant CARRY_WINDOW_COMPLETENESS_PCT = 80;
+    /// @dev 缓冲释放量按「售票窗口完整度」等比例打折：
+    ///      释放额 = 缓冲余额 × (实际窗口 / 名义窗口)。
+    ///      `performUpkeep` 无权限、开期时刻由调用者选，攻击者可故意拖到临近下一场次
+    ///      才开期使窗口极短、再在同一笔交易里买光独占（第四轮结构性发现）；打折后
+    ///      压缩窗口会等比例削减本期可捕获的额度。
+    ///      **刻意不用 0/1 阈值**：那会在 keeper 持续不及时时把缓冲永久卡死，
+    ///      与「阶跃门槛导致永久冻结」是同一个坑（本轮自查实测复现）
     uint64 public constant DRAW_TIMEOUT = 3 hours; // FR-C-14
     uint64 public constant CLAIM_WINDOW = 90 days; // FR-C-19
     uint16 public constant BPS_DENOMINATOR = 10000;
@@ -751,15 +751,22 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         uint64 prevDraw = prevSlot + SEAL_GAP;
         uint256 nominal = t > prevDraw ? t - prevDraw : 0;
         uint256 actual = t > block.timestamp ? t - block.timestamp : 0;
-        bool timely = nominal == 0 || actual * 100 >= nominal * CARRY_WINDOW_COMPLETENESS_PCT;
+        uint256 pct = nominal == 0 ? 100 : (actual * 100) / nominal;
+        if (pct > 100) pct = 100;
 
         r.pot = carryPot;
         r.tier1Carry = carryTier1;
-        if (timely) {
-            r.pot += s_pendingPot;
-            r.tier1Carry += s_pendingTier1;
-            s_pendingPot = 0;
-            s_pendingTier1 = 0;
+        // 按窗口完整度**打折**释放，而不是 0/1 门：
+        // 0/1 门在 keeper 持续不及时时会让缓冲永远出不来（自查实测：6 期未释放），
+        // 与上一轮「阶跃门槛导致永久冻结」是同一个坑。打折后压缩窗口只会减少本期
+        // 可释放的额度（削弱择时独占的收益），而不会把资金卡死
+        if (pct > 0) {
+            uint256 releasePot = (s_pendingPot * pct) / 100;
+            uint256 releaseTier1 = (s_pendingTier1 * pct) / 100;
+            r.pot += releasePot;
+            r.tier1Carry += releaseTier1;
+            s_pendingPot -= releasePot;
+            s_pendingTier1 -= releaseTier1;
         }
         // 开期时 pot 全部来自 carry（本期尚无自售），据此建立配比释放的基线
         r.carriedPot = r.pot;
