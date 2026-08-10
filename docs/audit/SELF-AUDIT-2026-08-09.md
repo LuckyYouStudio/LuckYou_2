@@ -233,3 +233,87 @@ carry 落在结算期之后开出的新期（而非紧邻的下一期），滚�
 - 测试数：76 个全绿；`Lottery.sol` 行覆盖 99.27% / 分支 89.47%
 - 不变量测试已纳入 s_pendingPot / s_pendingTier1，偿付恒等式仍成立
 - **需再次重新部署**：当前测试网实例 `0xd3820e…00e9` 不含 A/B/D 修复
+
+---
+
+# 第三轮：操纵「参与者集合」（2026-08-10）
+
+第二轮修复后的再复查。主题与首轮 Critical 同源：**都不是偷钱，而是操纵一个被授予的权限，
+把概率性中奖变成确定性获取**。首轮堵了「操纵随机数」，这轮堵的是「操纵参与者集合」——
+而且更简单，不用部署假合约、不用暴搜种子。
+
+| # | 严重度 | 问题 | 状态 |
+|---|---|---|---|
+| 1 | **High** | owner 用 setSalesPaused 全程清场、末秒解禁自购，独占整包奖池 | ✅ 已修复 + PoC 回归 |
+| 2 | **Medium** | 修复 A 的残余：新期售票窗口长度由 performUpkeep 调用者择时决定，可压到 1 秒 | ✅ 已修复 + 回归 |
+| 3 | — | 参与度门槛（首轮候选 (a)，本轮落地） | ✅ 已实现（局限见下） |
+| 遗留 | Low | E 只修了 page.tsx；injectPot JS Number 精度；I broadcast 入库 | ✅ 全部处理 |
+
+## 1（High）— setSalesPaused 清场独占【已修复】
+
+FR-C-24「无任何管理员函数能动到未领奖金」为真，首轮「确无 sweep」的结论也为真——
+但 owner **不需要搬，他可以合法地「赢」**：
+
+1. 等某期奖池变肥（缓冲释放 / 第三方注资 / 大额滚存）
+2. `setSalesPaused(true)` —— 整个售票窗口内无人能买
+3. `closeTime - 1` 秒：`setSalesPaused(false)` + `buyTickets(8)`
+4. 唯一买家 → 持全部票号 → 必中全奖级 → 领走
+
+**PoC 实测**：owner 花 8 USDC，赢 106.92，净赚 98.92；测试中断言了 bob 全程被
+`SalesArePaused` 挡在门外。不需要 keeper 缺席、不需要 VRF 异常，任何时候都能执行。
+
+**修复**：`Round.salesPausedAtOpen` —— 本期能否购票在 `_openNextRound` 时快照定死，
+`buyTickets` 检查快照而非全局标志。owner 想清场就必须在开期**之前**决定，而那样
+他自己也买不了这一期。**代价**：紧急停售最多延后一期生效，已写入 FR-C-23。
+回归：`test/LotteryFieldControl.t.sol`。
+
+## 2（Medium）— 修复 A 的残余：窗口长度可被择时【已修复】
+
+第二轮修复 A 的安全论据是「新期拥有完整未封盘的售票窗口，无人能预先卡位」。
+**前半句成立，后半句不成立**——新期 closeTime 取「晚于 `block.timestamp` 的最近场次」，
+而 `performUpkeep` 无权限任何人可调，**窗口多长由调用者选**。卡在下一场次前 1 秒调用，
+新期就只有 1 秒售票窗口，而缓冲区恰好在这一刻并入它的 pot。
+
+前提是 keeper 缺席——但 SPEC Q8 白纸黑字写了「keeper 不在信任边界内」，
+这正是 `performUpkeep` 设计成无权限的理由，那它被恶意择时也必须安全。
+`FAST_INTERVAL_SECONDS=7200` 的部署模式下只需缺席 45 分钟。
+
+**修复**：`MIN_SALES_WINDOW = 30 minutes`，`_openNextRound` 跳过距今不足此值的场次；
+构造器同步收紧为 `interval > SEAL_GAP + MIN_SALES_WINDOW`（并解旧发现 H）。
+PoC 中的窗口从 1 秒变为 172801 秒。
+
+## 3 — 参与度门槛（FR-C-27）与其**诚实的局限**
+
+首轮列为候选 (a)、标「待决策」，本轮落地：`MIN_TICKETS_FOR_CARRY = 100`，
+票数不足时 `carriedPot` 与 `tier1Carry` 退回缓冲顺延，只分配本期自售所得。
+
+**但必须说清它做不到什么**：它把「买 8 张吃掉整包滚存」变成不划算（PoC 中收益
+从 +98.92 变为 −0.08，即只亏手续费），**却不能在理论上消除捕获**——攻击者买满 100 张
+同样能解锁，而他自己投入的钱会随中奖回到自己手里，净收益仍是滚存额减手续费。
+**「买光全场即可拿走全部奖池」是抽签制彩票的固有性质**，真正的稀释只能来自其他人的
+实际参与。门槛抬高的是资本效率门槛（从 8 USDC 撬动 106 变成需要 100 USDC 撬动同样的量），
+是缓解不是根治。已如实写入 FR-C-27。
+
+## 遗留项处理
+
+- **E（补完）**：`history/page.tsx` 的 1e6 硬编码已清除。token 精度/符号/票价的读取
+  抽到 `lib/contracts.ts` 的 `loadTokenMeta()`，两个页面共用（符合 FR-W-07 单一出口）。
+- **injectPot 精度（新 Low，已修）**：改用整数字符串解析 `parseTokenAmount()`，
+  18 位精度下 `100 * 1e18` 超过 `MAX_SAFE_INTEGER` 的失真问题消除。
+- **I（根因已解，已修）**：真正原因是 **两个 .gitignore 冲突**——forge 生成的
+  `contracts/.gitignore` 里有 `!/broadcast` 否定规则，覆盖了根 `.gitignore` 的
+  `contracts/broadcast/`。现让声明与现实一致：根 .gitignore 不再重复声明，
+  `contracts/.gitignore` 增加 `/broadcast/**/run-[0-9]*.json` 忽略时间戳快照，
+  只保留 `run-latest.json` 作部署存档。
+- **F（维持）**：`getRanges`/`ticketsOwned` 是 view 函数，不消耗用户 gas；
+  已通过 multicall 批处理 + 10 秒轮询 + 结算结果缓存缓解。单期 ranges 极大时是
+  RPC 响应变慢的性能问题，非资金风险。彻底解决需前端改为纯事件重建，列为后续优化。
+- **G（澄清并维持）**：`ReceiverTemplate.sol` 是 Chainlink 官方 vendored 模板，
+  其未覆盖部分是我们未使用的可选权限配置 setter。FR-T-01 的 90% 针对本项目自有合约
+  `Lottery.sol`：**行 99.32% / 分支 90.16%，达标**。
+
+## 第三轮后状态
+
+- 测试数：81 个全绿；`Lottery.sol` 行覆盖 99.32% / 分支 90.16%
+- 不变量测试（含缓冲区）在新增的门槛与快照逻辑下依然成立
+- **需再次重新部署**：`0x18093BCC…0c38` 不含第三轮修复

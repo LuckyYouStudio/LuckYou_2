@@ -234,10 +234,15 @@ contract LotteryBuyTest is LotteryTestBase {
         vm.stopPrank();
     }
 
+    /// @dev 暂停在「下一期开出时」生效（快照语义，审计第三轮 #1）。
+    ///      对已开出的期无效的回归见 LotteryFieldControl.t.sol
     function test_RevertWhen_BuyWhilePaused() public {
         lottery.setSalesPaused(true);
-        token.mint(alice, PRICE);
-        vm.startPrank(alice);
+        _buy(alice, 1); // 第 1 期开期时未暂停，仍可购票
+        _settleRound(1, 42); // 开出第 2 期时快照 paused=true
+
+        token.mint(bob, PRICE);
+        vm.startPrank(bob);
         token.approve(address(lottery), PRICE);
         vm.expectRevert(Lottery.SalesArePaused.selector);
         lottery.buyTickets(1);

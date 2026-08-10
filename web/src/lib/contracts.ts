@@ -157,6 +157,63 @@ export function injectedWalletFor(account: Address) {
   return createWalletClient({ chain, transport: custom(provider), account });
 }
 
+// ===== 计价 token 元数据（审计 E：不硬编码精度/符号/票价，一律从链上读）=====
+
+export const TOKEN = { decimals: 6, symbol: "USDC", ticketPrice: 0n as bigint, loaded: false };
+
+let tokenMetaPromise: Promise<void> | null = null;
+
+/** 读取并缓存 token 精度、符号与票价（都是 immutable，只读一次） */
+export function loadTokenMeta(): Promise<void> {
+  if (!tokenMetaPromise) {
+    tokenMetaPromise = (async () => {
+      const [decimals, symbol, price] = await Promise.all([
+        publicClient.readContract({
+          address: addresses.usdc,
+          abi: erc20Abi,
+          functionName: "decimals",
+        }) as Promise<number>,
+        publicClient.readContract({
+          address: addresses.usdc,
+          abi: erc20Abi,
+          functionName: "symbol",
+        }) as Promise<string>,
+        publicClient.readContract({
+          address: addresses.lottery,
+          abi: lotteryAbi,
+          functionName: "i_ticketPrice",
+        }) as Promise<bigint>,
+      ]);
+      TOKEN.decimals = decimals;
+      TOKEN.symbol = symbol;
+      TOKEN.ticketPrice = price;
+      TOKEN.loaded = true;
+    })().catch((e) => {
+      tokenMetaPromise = null; // 允许重试
+      throw e;
+    });
+  }
+  return tokenMetaPromise;
+}
+
+/** 按 token 精度格式化金额 */
+export function fmtToken(x: bigint): string {
+  const s = x.toString().padStart(TOKEN.decimals + 1, "0");
+  const int = s.slice(0, s.length - TOKEN.decimals);
+  const frac = TOKEN.decimals > 0 ? s.slice(s.length - TOKEN.decimals).replace(/0+$/, "") : "";
+  const intFmt = Number(int).toLocaleString("zh-CN");
+  return `${intFmt}${frac ? `.${frac}` : ""} ${TOKEN.symbol}`;
+}
+
+/** 把用户输入的小数金额转成 token 最小单位（避免 JS Number 在 18 位精度下失真） */
+export function parseTokenAmount(input: string): bigint {
+  const trimmed = input.trim();
+  if (!/^\d*\.?\d*$/.test(trimmed) || trimmed === "" || trimmed === ".") return 0n;
+  const [intPart, fracPart = ""] = trimmed.split(".");
+  const frac = fracPart.slice(0, TOKEN.decimals).padEnd(TOKEN.decimals, "0");
+  return BigInt(intPart || "0") * 10n ** BigInt(TOKEN.decimals) + BigInt(frac || "0");
+}
+
 /** anvil 时间控制（仅本地测试台使用） */
 export async function advanceTime(seconds: number) {
   await publicClient.request({

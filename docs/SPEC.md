@@ -101,7 +101,13 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   ```
   其中 `drawTime = closeTime + SEAL_GAP`，`SEAL_GAP` **MUST** 是 `constant`
   （75 分钟），对应双色球「20:00 停售、21:15 开奖」的间隔。
-  closeTime 到 drawTime 之间为封盘期：状态仍是 OPEN，但购票已被 FR-C-09 拒绝
+  closeTime 到 drawTime 之间为封盘期：状态仍是 OPEN，但购票已被 FR-C-09 拒绝。
+  - **最短售票窗口（2026-08-10 第三轮自查 #2）**：新期 closeTime **MUST** 距开期时刻
+    至少 `MIN_SALES_WINDOW`（30 分钟，`constant`），不足则跳到下一场次；
+    构造参数的场次间隔 **MUST** 大于 `SEAL_GAP + MIN_SALES_WINDOW`。
+    理由：`performUpkeep` 无权限、任何人可择时调用，若无下限，调用者可卡在下一场次前
+    1 秒开期，使新期仅有 1 秒售票窗口供自己独占（同时并解旧发现 H）
+  - 验收：keeper 缺席时择时调用 `performUpkeep`，新期售票窗口仍 ≥ MIN_SALES_WINDOW
 - **FR-C-09** `buyTickets` 在 `state != OPEN` 或 `block.timestamp >= closeTime` 时
   **MUST** revert（即使 keeper 还没跑）
   - 理由：防止有人卡在截止边缘、已知即将开奖时下注
@@ -143,6 +149,18 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   - 验收：提走全部 fees 后，各期 pot 之和不变，合约余额仍 ≥ 所有未领奖金
 - **FR-C-21** 抽成比例上限 `MAX_FEE_BPS` **MUST** 是 `constant`（1000 = 10%），
   owner 也无法突破。部署默认 `feeBps` **MUST** 为 100（1%）（2026-08-07 定）
+- **FR-C-27** 滚存/注资的参与度门槛（2026-08-10 第三轮自查增）：本期票数低于
+  `MIN_TICKETS_FOR_CARRY`（100，`constant`）时，pot 中「非本期自售」的部分
+  （滚存承接 + 注资，即 `carriedPot`）与 `tier1Carry` **MUST NOT** 予以分配，
+  而是原样退回缓冲区顺延到后续期；只分配本期自售所得。
+  - 理由：抬高「用最少的票吃掉整包滚存」的资本门槛
+  - **诚实的局限**：这不能在理论上消除捕获——攻击者买满门槛票数仍可独占，
+    只是所需资本从「几张票」升到「门槛票数」，且自己投入的钱会回到自己手里，
+    净收益仍为滚存额减手续费。**买光全场即可拿走全部奖池，是抽签制彩票的固有性质**，
+    真正的稀释只能来自其他人的实际参与。门槛是缓解，不是根治
+  - 验收：注资 200、仅买 8 张时该 200 退回缓冲，买家只赢到自售奖池且净亏手续费；
+    买满 100 张时滚存正常分配
+
 - **FR-C-26** 冷启动注资（2026-08-07 增）：**MUST** 提供
   `injectPot(uint32 roundId, uint256 amount)`，任何人可向处于 OPEN 状态的期
   注入 token，全额计入该期 pot、不抽成，SafeERC20 收款并 emit `PotInjected`。
@@ -164,6 +182,10 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
 - **FR-C-23** `setSalesPaused(true)` **MUST** 只影响 `buyTickets`。
   `claim` / `rolloverExpired` / `retryDraw` **MUST** 不受影响
   - 验收：暂停状态下中奖者仍能成功领奖
+  - **快照语义（2026-08-10 第三轮自查 #1）**：本期能否购票 **MUST** 在开期时快照定死，
+    暂停设置只作用于此后开出的新期。否则 owner 可全程暂停清场、末秒解禁自购，
+    成为唯一买家独占整包奖池（PoC：花 8 USDC 赢 106.92）。代价是紧急停售最多延后一期生效
+  - 验收：已开出的期被暂停后，他人仍可购票；下一期开出时对所有人（含 owner）一律禁售
 - **FR-C-24** **MUST NOT** 存在任何形式的 `emergencyWithdraw` / `sweep` /
   `rescueTokens`，能动到未领奖金。
   - **外部信任方披露（2026-08-10 安全自查 C）**：合约依赖的 Chainlink VRF 订阅

@@ -53,8 +53,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         uint32 ticketCount;
         uint16 claimedBits; // 中奖 slot 领取位图（slot 总数 ≤ 16）
         bool expiredRolled; // 过期未领奖金是否已滚存
+        bool salesPausedAtOpen; // 开期时的暂停状态快照（修复：见 setSalesPaused）
         uint64 drawRequestedAt;
         uint256 pot; // 本期可分配奖金（购票分账 + 注资 + 承接的过期滚存）
+        uint256 carriedPot; // pot 中「非本期自售」的部分（滚存承接 + 注资），受参与度门槛保护
         uint256 tier1Carry; // 上期滚入、计入本期一等奖份额的金额（Q1 双色球逻辑）
         uint256 vrfRequestId;
         uint256 randomSeed;
@@ -113,6 +115,12 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     uint16 public constant MAX_FEE_BPS = 1000; // 10% 硬上限（FR-C-21）
     uint32 public constant MAX_TICKETS_PER_TX = 1000; // FR-C-06
     uint64 public constant SEAL_GAP = 75 minutes; // 停售→开奖间隔（FR-C-08，对应双色球 20:00→21:15）
+    /// @notice 新期最短售票窗口。performUpkeep 无权限、任何人可择时调用，若不设下限，
+    ///         调用者可卡在下一场次前 1 秒开期，使新期只有极短窗口供自己独占（审计第三轮 #2）
+    uint64 public constant MIN_SALES_WINDOW = 30 minutes;
+    /// @notice 滚存/注资资金的最低参与度门槛：本期票数不足时这部分不予分配，退回缓冲区
+    ///         顺延到后续期。用于抬高「独占滚存」的资本门槛（审计第三轮 #1/#2 缓解）
+    uint32 public constant MIN_TICKETS_FOR_CARRY = 100;
     uint64 public constant DRAW_TIMEOUT = 3 hours; // FR-C-14
     uint64 public constant CLAIM_WINDOW = 90 days; // FR-C-19
     uint16 public constant BPS_DENOMINATOR = 10000;
@@ -188,8 +196,9 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         if (feeBps > MAX_FEE_BPS) revert FeeTooHigh();
         if (intervals.length == 0) revert InvalidSchedule();
         for (uint256 i = 0; i < intervals.length; i++) {
-            // 间隔必须大于封盘时长，否则下一期在上一期开奖前就已截止
-            if (intervals[i] <= SEAL_GAP) revert InvalidSchedule();
+            // 间隔必须大于「封盘时长 + 最短售票窗口」，否则日程本身就排不出
+            // 一个可正常售票的期（审计第三轮 #2，同时并解旧发现 H）
+            if (intervals[i] <= SEAL_GAP + MIN_SALES_WINDOW) revert InvalidSchedule();
         }
         if (tierBps.length == 0 || tierBps.length != tierWinnerCounts.length) {
             revert InvalidTierConfig();
@@ -222,9 +231,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
 
     /// @notice 购买连续票号的彩票，一次购买只写入一条 Range（FR-C-04）
     function buyTickets(uint32 quantity) external {
-        if (s_salesPaused) revert SalesArePaused();
         uint32 roundId = s_currentRound;
         Round storage r = s_rounds[roundId];
+        // 用开期快照而非全局标志：暂停对「已开出的期」无效，owner 无法中途清场后自购
+        if (r.salesPausedAtOpen) revert SalesArePaused();
         if (r.state != RoundState.OPEN) revert RoundNotOpen();
         // FR-C-09：到达停售时刻即拒绝，即使 keeper 尚未触发
         if (block.timestamp >= r.closeTime) revert SalesClosed();
@@ -254,6 +264,8 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         if (block.timestamp >= r.closeTime) revert SalesClosed();
         if (amount == 0) revert InvalidQuantity();
         r.pot += amount;
+        // 注资同样是「非本期自售」的钱，受参与度门槛保护，避免被小额独占
+        r.carriedPot += amount;
         emit PotInjected(roundId, msg.sender, amount);
         i_token.safeTransferFrom(msg.sender, address(this), amount);
     }
@@ -344,6 +356,25 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         r.randomSeed = seed;
 
         uint256 pot = r.pot;
+        uint256 tier1CarryIn = r.tier1Carry;
+        // 参与度门槛（审计第三轮）：本期票数不足时，滚存承接与注资的钱不予分配，
+        // 原样退回缓冲区顺延，只分配本期自售所得。这抬高了「独占滚存」所需的资本，
+        // 使「买最少的票吃掉整包滚存」不再划算
+        if (r.ticketCount < MIN_TICKETS_FOR_CARRY) {
+            uint256 heldBack = r.carriedPot;
+            if (heldBack > 0) {
+                s_pendingPot += heldBack;
+                pot -= heldBack;
+            }
+            if (tier1CarryIn > 0) {
+                s_pendingTier1 += tier1CarryIn;
+                tier1CarryIn = 0;
+            }
+            if (heldBack + r.tier1Carry > 0) {
+                emit PrizeRolledOver(roundId, s_currentRound + 1, heldBack + r.tier1Carry);
+            }
+        }
+
         uint256 tierCount = s_tierBps.length;
         uint256 splitTotal = 0;
         uint256 carryOut = 0;
@@ -352,7 +383,7 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
             uint256 amount = (pot * s_tierBps[tier]) / BPS_DENOMINATOR;
             splitTotal += amount;
             if (tier == 0) {
-                amount += r.tier1Carry; // Q1：上期滚存计入一等奖份额
+                amount += tier1CarryIn; // Q1：上期滚存计入一等奖份额（未达门槛时已置 0）
             }
             uint8 winners = s_tierWinnerCounts[tier];
             if (winners > r.ticketCount) {
@@ -461,10 +492,23 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         emit FeeBpsUpdated(feeBps);
     }
 
-    /// @notice 暂停/恢复售票。只影响 buyTickets，领奖、滚存、重试开奖不受影响（FR-C-23）
+    /// @notice 暂停/恢复售票。只影响 buyTickets，领奖、滚存、重试开奖不受影响（FR-C-23）。
+    /// @dev **对已开出的期无效**：能否购票在开期时快照定死（`salesPausedAtOpen`），
+    ///      本设置只作用于此后开出的新期。这是为堵住「owner 全程暂停清场、末秒解禁自购、
+    ///      独占整包奖池」而刻意付出的代价（审计第三轮 #1）——紧急停售因此最多延后一期生效。
     function setSalesPaused(bool paused) external onlyOwner {
         s_salesPaused = paused;
         emit SalesPausedUpdated(paused);
+    }
+
+    /// @notice 本期是否可购票（开期时的暂停快照）
+    function salesOpenFor(uint32 roundId) external view returns (bool) {
+        return !s_rounds[roundId].salesPausedAtOpen;
+    }
+
+    /// @notice 本期 pot 中「非本期自售」的部分（滚存承接 + 注资），受参与度门槛保护
+    function carriedPotOf(uint32 roundId) external view returns (uint256) {
+        return s_rounds[roundId].carriedPot;
     }
 
     // ===== 视图 =====
@@ -589,10 +633,12 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         uint64 t = s_lastSlotTime;
         uint32 cursor = s_intervalCursor;
         uint32 len = uint32(s_intervals.length);
+        // 跳过距今不足 MIN_SALES_WINDOW 的场次：performUpkeep 任何人可择时调用，
+        // 若只要求 t > now，调用者可开出仅 1 秒售票窗口的期供自己独占（审计第三轮 #2）
         do {
             t += s_intervals[cursor];
             cursor = (cursor + 1) % len;
-        } while (t <= block.timestamp);
+        } while (t <= block.timestamp + MIN_SALES_WINDOW);
         s_lastSlotTime = t;
         s_intervalCursor = cursor;
 
@@ -600,9 +646,13 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         Round storage r = s_rounds[newId];
         r.state = RoundState.OPEN;
         r.closeTime = t;
-        // 消费滚存缓冲区（修复 A）：过期滚存与未开出奖级 carry 在此并入新期，
-        // 新期拥有完整未封盘的售票窗口，无人能预先卡位独占
+        // 暂停状态快照（审计第三轮 #1）：本期能否购票在开期时一次性定死。
+        // 否则 owner 可全程暂停清场、末秒解禁自购，独占整包奖池
+        r.salesPausedAtOpen = s_salesPaused;
+        // 消费滚存缓冲区：过期滚存与未开出奖级 carry 在此并入新期。
+        // 开期时 pot 全部来自 carry（本期尚无自售），据此建立参与度门槛的基线
         r.pot = carryPot + s_pendingPot;
+        r.carriedPot = r.pot;
         r.tier1Carry = carryTier1 + s_pendingTier1;
         s_pendingPot = 0;
         s_pendingTier1 = 0;

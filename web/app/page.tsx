@@ -10,7 +10,11 @@ import {
   chain,
   connectInjected,
   erc20Abi,
+  fmtToken,
+  loadTokenMeta,
+  parseTokenAmount,
   selectedWalletName,
+  TOKEN,
   expectedChainId,
   injectedWalletFor,
   lotteryAbi,
@@ -44,13 +48,8 @@ interface LogEntry {
   text: string;
 }
 
-// 计价 token 元数据从链上读取（审计 E：不再硬编码 6 位精度 / USDC / 1e6 票价）
-const TOKEN = { decimals: 6, symbol: "USDC" };
-
-function fmt6(x: bigint): string {
-  const unit = 10 ** TOKEN.decimals;
-  return `${(Number(x) / unit).toLocaleString("zh-CN", { maximumFractionDigits: TOKEN.decimals })} ${TOKEN.symbol}`;
-}
+// 金额格式化统一走 lib/contracts 的链上元数据（审计 E）
+const fmt6 = fmtToken;
 
 function fmtTs(t: bigint): string {
   if (t === 0n) return "-";
@@ -240,17 +239,9 @@ export default function Home() {
           functionName: "s_salesPaused",
         })) as boolean,
       );
-      // token 元数据与票价是 immutable，只读一次（审计 E）
-      if (ticketPrice === 0n) {
-        const [dec, sym, price] = await Promise.all([
-          publicClient.readContract({ address: addresses.usdc, abi: erc20Abi, functionName: "decimals" }) as Promise<number>,
-          publicClient.readContract({ address: addresses.usdc, abi: erc20Abi, functionName: "symbol" }) as Promise<string>,
-          publicClient.readContract({ address: addresses.lottery, abi: lotteryAbi, functionName: "i_ticketPrice" }) as Promise<bigint>,
-        ]);
-        TOKEN.decimals = dec;
-        TOKEN.symbol = sym;
-        setTicketPrice(price);
-      }
+      // token 精度/符号/票价都是 immutable，共享模块只读一次（审计 E）
+      await loadTokenMeta();
+      if (ticketPrice !== TOKEN.ticketPrice) setTicketPrice(TOKEN.ticketPrice);
     } catch (e) {
       log("err", `刷新失败：${(e as Error).message.slice(0, 120)}`);
     }
@@ -478,7 +469,9 @@ export default function Home() {
               disabled={busy !== null}
               onClick={() =>
                 act(`注资 ${injectAmt} ${TOKEN.symbol}`, async () => {
-                  const amt = BigInt(Math.round(parseFloat(injectAmt) * 10 ** TOKEN.decimals));
+                  // 用整数解析，避免 18 位精度下 JS Number 超出安全整数范围而失真（审计 Low）
+                  const amt = parseTokenAmount(injectAmt);
+                  if (amt === 0n) throw new Error("注资金额无效");
                   if (allowance < amt) {
                     await write(addresses.usdc, erc20Abi, "approve", [addresses.lottery, amt]);
                   }

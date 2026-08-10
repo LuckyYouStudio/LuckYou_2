@@ -10,6 +10,8 @@ out/
 !/broadcast
 /broadcast/*/31337/
 /broadcast/**/dry-run/
+# 每次部署都会新增一份时间戳快照，与 run-latest.json 内容重复；只保留后者作存档
+/broadcast/**/run-[0-9]*.json
 
 # Docs
 docs/

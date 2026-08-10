@@ -5,7 +5,9 @@
 # Foundry
 contracts/out/
 contracts/cache/
-contracts/broadcast/
+# 注意：broadcast/ 由 contracts/.gitignore 精细管理（forge 惯例：保留真实网络的
+# run-latest.json 作部署存档，忽略本地链、dry-run 与时间戳快照）。此处不再重复声明，
+# 否则会与 forge 生成的 `!/broadcast` 否定规则冲突，造成「声明忽略但实际入库」
 
 # Node / Next.js
 node_modules/

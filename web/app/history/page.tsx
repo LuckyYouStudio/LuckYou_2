@@ -6,7 +6,16 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { isAddress, parseAbiItem, type Address } from "viem";
-import { ANVIL_ACCOUNTS, IS_LOCAL, addresses, publicClient, startBlock } from "@/lib/contracts";
+import {
+  ANVIL_ACCOUNTS,
+  IS_LOCAL,
+  TOKEN,
+  addresses,
+  fmtToken,
+  loadTokenMeta,
+  publicClient,
+  startBlock,
+} from "@/lib/contracts";
 
 const TICKETS_BOUGHT = parseAbiItem(
   "event TicketsBought(uint32 indexed roundId, address indexed buyer, uint32 start, uint32 quantity)",
@@ -33,7 +42,7 @@ interface ClaimRecord {
 }
 
 function fmt6(x: bigint): string {
-  return `${(Number(x) / 1e6).toLocaleString("zh-CN", { maximumFractionDigits: 6 })} USDC`;
+  return fmtToken(x);
 }
 
 export default function History() {
@@ -52,6 +61,7 @@ export default function History() {
     setLoading(true);
     setError(null);
     try {
+      await loadTokenMeta();
       const latest = await publicClient.getBlockNumber();
       const buyRecords: BuyRecord[] = [];
       const claimRecords: ClaimRecord[] = [];
@@ -102,7 +112,7 @@ export default function History() {
     load();
   }, [load]);
 
-  const totalSpent = buys.reduce((s, b) => s + BigInt(b.quantity) * 1_000_000n, 0n);
+  const totalSpent = buys.reduce((s, b) => s + BigInt(b.quantity) * TOKEN.ticketPrice, 0n);
   const totalWon = claims.reduce((s, c) => s + c.amount, 0n);
 
   return (
@@ -170,7 +180,7 @@ export default function History() {
                     {b.start} ~ {b.start + b.quantity - 1}
                   </td>
                   <td>{b.quantity}</td>
-                  <td>{fmt6(BigInt(b.quantity) * 1_000_000n)}</td>
+                  <td>{fmt6(BigInt(b.quantity) * TOKEN.ticketPrice)}</td>
                   <td>{b.block.toString()}</td>
                 </tr>
               ))}
