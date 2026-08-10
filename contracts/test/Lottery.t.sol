@@ -367,7 +367,8 @@ contract LotteryDrawTest is LotteryTestBase {
         assertEq(lottery.s_currentRound(), 2);
     }
 
-    /// @dev FR-C-26：VOIDED 期的注资滚入下期奖池
+    /// @dev FR-C-26：VOIDED 期的注资经缓冲区转出（第四轮修复：不再直接注入下期，
+    ///      否则可被「让期空转 + 压缩窗口时触发 VOID」绕过按窗口打折的释放规则）
     function test_VoidedRound_InjectionRollsToNextPot() public {
         token.mint(alice, 50e6);
         vm.startPrank(alice);
@@ -376,10 +377,14 @@ contract LotteryDrawTest is LotteryTestBase {
         vm.stopPrank();
 
         vm.warp(_drawTimeOf(1));
+        // toRound 恒为 0：进缓冲时去向未定，真正去向由 CarryReleased 给出
         vm.expectEmit(true, true, false, true);
-        emit Lottery.PrizeRolledOver(1, 2, 50e6);
+        emit Lottery.PrizeRolledOver(1, 0, 50e6);
         lottery.performUpkeep("");
-        assertEq(_potOf(2), 50e6);
+
+        // 及时触发 → 缓冲全额释放进新开出的第 2 期
+        assertEq(_potOf(2), 50e6, "released into round 2");
+        assertEq(lottery.s_pendingPot(), 0, "buffer drained");
     }
 
     /// @dev Q2：极端延迟时跳过已错过的场次，closeTime 永远在未来且落在日程网格上

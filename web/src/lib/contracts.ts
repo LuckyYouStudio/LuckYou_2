@@ -130,7 +130,9 @@ export async function connectInjected(): Promise<Address> {
         method: "wallet_switchEthereumChain",
         params: [{ chainId: `0x${chain.id.toString(16)}` }],
       });
-    } catch {
+    } catch (e) {
+      // 只有「链未添加」(4902) 才走 add；用户拒绝 (4001) 不应再弹一次
+      if ((e as { code?: number }).code !== 4902) throw e;
       await provider.request({
         method: "wallet_addEthereumChain",
         params: [
@@ -146,6 +148,25 @@ export async function connectInjected(): Promise<Address> {
     }
   }
   return accounts[0];
+}
+
+/** 读取钱包当前所在链（用于写操作前校验，FR-W-05）。本地模式恒返回目标链 */
+export async function walletChainId(): Promise<number> {
+  if (IS_LOCAL) return chain.id;
+  const provider = selectedProvider ?? window.ethereum;
+  if (!provider) throw new Error("未检测到浏览器钱包");
+  const hex = (await provider.request({ method: "eth_chainId" })) as string;
+  return parseInt(hex, 16);
+}
+
+/** 请求钱包切换到目标链（错链时给用户一个可点的出口） */
+export async function switchToTargetChain(): Promise<void> {
+  const provider = selectedProvider ?? window.ethereum;
+  if (!provider) throw new Error("未检测到浏览器钱包");
+  await provider.request({
+    method: "wallet_switchEthereumChain",
+    params: [{ chainId: `0x${chain.id.toString(16)}` }],
+  });
 }
 
 /** 测试网模式：通过已选定的注入钱包签名 */

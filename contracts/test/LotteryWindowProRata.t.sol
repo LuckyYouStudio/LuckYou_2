@@ -70,4 +70,24 @@ contract LotteryWindowProRataTest is LotteryTestBase {
         assertGt(released, 0, "still releases something");
         assertLt(released, seeded / 2, "but much less than a timely open would");
     }
+
+    /// @dev 回归（第四轮复查 M-1）：正式日程「3 天」那一腿名义窗口达 70.75 小时，
+    ///      若释放比例用百分比整数除法，keeper 稍晚就会算出 0% 使缓冲一分不出。
+    ///      改用 bps 精度后，即便窗口被压到下限也仍有可观释放。
+    function test_LongNominalWindowStillReleases() public {
+        _buy(alice, 3);
+        _settleRound(1, 7);
+        uint256 seeded = _buffer();
+        assertGt(seeded, 0);
+
+        // 让下一期落在「3 天」那一腿上，并把实际窗口压到最短
+        uint32 r = lottery.s_currentRound();
+        _buy(bob, 10);
+        uint64 nextSlot = _closeTimeOf(r) + 3 days; // 长腿
+        vm.warp(uint256(nextSlot) - lottery.MIN_SALES_WINDOW() - 1);
+        lottery.performUpkeep("");
+        _fulfill(r, 42);
+
+        assertLt(_buffer(), seeded, "long nominal window must not round the release down to zero");
+    }
 }

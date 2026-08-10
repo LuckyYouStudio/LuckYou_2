@@ -10,6 +10,8 @@ import {
   chain,
   connectInjected,
   erc20Abi,
+  switchToTargetChain,
+  walletChainId,
   fmtToken,
   loadTokenMeta,
   parseTokenAmount,
@@ -26,7 +28,10 @@ import {
 const STATE_NAMES = ["未创建", "售票中", "开奖中", "已结算", "已作废"] as const;
 const STATE_TAGS = ["", "open", "drawing", "settled", "voided"] as const;
 const TIER_NAMES = ["一等奖", "二等奖", "三等奖"];
-const HISTORY_LIMIT = 8;
+const HISTORY_LIMIT = 8; // 期次历史表的显示条数
+// 领奖窗口 90 天；按最短场次间隔（快节奏实例 2 小时）反推需回溯的期数上限，
+// 避免中奖者因界面只看最近几期而错失奖金（审计第九轮 C1）
+const CLAIM_SCAN_ROUNDS = 120;
 
 interface RoundInfo {
   id: number;
@@ -81,6 +86,11 @@ export default function Home() {
   const [treasuryBal, setTreasuryBal] = useState<bigint>(0n);
   const [paused, setPaused] = useState(false);
   const [ticketPrice, setTicketPrice] = useState<bigint>(0n);
+  // 领奖窗口 90 天远长于显示的 8 期，独立低频扫描，避免中奖者错失奖金（审计第九轮 C1）
+  const [claimable, setClaimable] = useState<{ roundId: number; tier: number; amount: bigint; deadline: bigint }[]>([]);
+  // 结算时按配比释放，原始 pot 与实际可分配额在大额滚存 + 低参与度时可差数量级
+  const [distributable, setDistributable] = useState<bigint>(0n);
+  const [salesOpen, setSalesOpen] = useState(true);
   const [feeBps, setFeeBps] = useState<number>(0);
   const [treasuryAddr, setTreasuryAddr] = useState<Address | null>(null);
   const [winners, setWinners] = useState<Map<number, { tickets: number[]; owners: Address[]; tiers: number[] }>>(
@@ -254,6 +264,22 @@ export default function Home() {
           functionName: "s_salesPaused",
         })) as boolean,
       );
+      setDistributable(
+        (await publicClient.readContract({
+          address: addresses.lottery,
+          abi: lotteryAbi,
+          functionName: "distributableEstimate",
+          args: [cur],
+        })) as bigint,
+      );
+      setSalesOpen(
+        (await publicClient.readContract({
+          address: addresses.lottery,
+          abi: lotteryAbi,
+          functionName: "salesOpenFor",
+          args: [cur],
+        })) as boolean,
+      );
       // token 精度/符号/票价都是 immutable，共享模块只读一次（审计 E）
       await loadTokenMeta();
       if (ticketPrice !== TOKEN.ticketPrice) setTicketPrice(TOKEN.ticketPrice);
@@ -261,6 +287,48 @@ export default function Home() {
       log("err", `刷新失败：${(e as Error).message.slice(0, 120)}`);
     }
   }, [account, log]);
+
+  // 低频扫描整个领奖窗口，独立于显示用的 8 期轮询（审计第九轮 C1）
+  const scanClaimable = useCallback(async () => {
+    if (!account || currentId === 0) {
+      setClaimable([]);
+      return;
+    }
+    try {
+      const from = Math.max(1, currentId - CLAIM_SCAN_ROUNDS + 1);
+      const ids: number[] = [];
+      for (let id = currentId; id >= from; id--) ids.push(id);
+      const results = await Promise.all(
+        ids.map(async (id) => {
+          const amounts = (await publicClient.readContract({
+            address: addresses.lottery,
+            abi: lotteryAbi,
+            functionName: "pendingPrizes",
+            args: [id, account],
+          })) as readonly bigint[];
+          if (!amounts.some((a) => a > 0n)) return [];
+          const [, deadline] = (await publicClient.readContract({
+            address: addresses.lottery,
+            abi: lotteryAbi,
+            functionName: "claimDeadlineOf",
+            args: [id],
+          })) as readonly [bigint, bigint];
+          return amounts
+            .map((amount, tier) => ({ roundId: id, tier, amount, deadline }))
+            .filter((x) => x.amount > 0n);
+        }),
+      );
+      setClaimable(results.flat());
+    } catch {
+      // 扫描失败不影响主界面，下一轮重试
+    }
+  }, [account, currentId]);
+
+  useEffect(() => {
+    scanClaimable();
+    const t = setInterval(scanClaimable, 60000);
+    return () => clearInterval(t);
+  }, [scanClaimable]);
 
   useEffect(() => {
     refresh();
@@ -290,6 +358,14 @@ export default function Home() {
   const write = useCallback(
     async (address: Address, abi: typeof lotteryAbi, functionName: string, args: unknown[]) => {
       if (!account) throw new Error("请先连接钱包");
+      // FR-W-05：写操作前校验**钱包**所在链（原实现查的是自家 RPC，恒等于目标链，
+      // 永远发现不了用户钱包在别的网络上）——审计第九轮 H3
+      const wcid = await walletChainId();
+      if (wcid !== expectedChainId) {
+        setWrongChain(true);
+        throw new Error(`钱包当前在链 ${wcid}，请切换到 ${chain.name}（${expectedChainId}）`);
+      }
+      setWrongChain(false);
       const client = IS_LOCAL ? walletFor(account) : injectedWalletFor(account);
       const hash = await client.writeContract({
         address,
@@ -299,23 +375,29 @@ export default function Home() {
         chain,
         account,
       });
-      await publicClient.waitForTransactionReceipt({ hash });
+      // viem 在交易 revert 时也正常 resolve，必须自己查 status，
+      // 否则失败的领奖/购票会被报成「成功」，用户以为拿到了钱（审计第九轮 H1）
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      if (receipt.status !== "success") {
+        throw new Error("交易已上链但执行失败（reverted），资金未变动");
+      }
     },
     [account],
   );
 
   const current = rounds.find((r) => r.id === currentId);
   const drawingRounds = rounds.filter((r) => r.state === 2);
+  // 严格整数解析并遵守合约的 MAX_TICKETS_PER_TX，避免用户先付了 approve 的 gas
+  // 才在 buyTickets 撞 ExceedsMaxPerTx（审计第九轮 L1/L2）
+  const qtyValid = /^\d+$/.test(qty.trim()) && Number(qty) >= 1 && Number(qty) <= 1000;
   const cost = useMemo(() => {
-    const n = parseInt(qty, 10);
-    return Number.isFinite(n) && n > 0 ? BigInt(n) * ticketPrice : 0n;
+    if (!/^\d+$/.test(qty.trim())) return 0n;
+    const n = Number(qty);
+    return n >= 1 && n <= 1000 ? BigInt(n) * ticketPrice : 0n;
   }, [qty, ticketPrice]);
   const needApprove = cost > 0n && allowance < cost;
 
-  const totalPending = rounds.reduce(
-    (sum, r) => sum + r.myPending.reduce((s, x) => s + x, 0n),
-    0n,
-  );
+  const totalPending = claimable.reduce((sum, c) => sum + c.amount, 0n);
 
   return (
     <main>
@@ -330,7 +412,22 @@ export default function Home() {
         </a>
       </p>
 
-      {wrongChain && <div className="banner" style={{ borderColor: "var(--red)" }}>{`⚠ 链 ID 不匹配：期望 ${expectedChainId}（${chain.name}），请切换网络`}</div>}
+      {wrongChain && (
+        <div className="banner" style={{ borderColor: "var(--red)" }}>
+          {`⚠ 钱包不在 ${chain.name}（链 ID ${expectedChainId}），交易将无法发出。`}{" "}
+          {!IS_LOCAL && (
+            <button
+              className="btn primary"
+              onClick={() => act("切换网络", async () => {
+                await switchToTargetChain();
+                setWrongChain(false);
+              })}
+            >
+              切换网络
+            </button>
+          )}
+        </div>
+      )}
 
       {totalPending > 0n && (
         <div className="banner">🎉 你有 {fmt6(totalPending)} 奖金未领取！在下方「我的奖金」中一键领取。</div>
@@ -357,6 +454,14 @@ export default function Home() {
                 <span className="k">奖池</span>
                 <span className="v big">{fmt6(current.pot)}</span>
               </div>
+              {distributable < current.pot && (
+                <div className="row">
+                  <span className="k">本期实际可分配</span>
+                  <span className="v" title="滚存/注资按本期售票额配比释放，超出部分顺延到后续期">
+                    {fmt6(distributable)}
+                  </span>
+                </div>
+              )}
               {current.tier1Carry > 0n && (
                 <div className="row">
                   <span className="k">滚入一等奖</span>
@@ -455,6 +560,9 @@ export default function Home() {
           </div>
           <div style={{ marginTop: 8 }}>
             <input value={qty} onChange={(e) => setQty(e.target.value)} placeholder="张数" />
+            {!qtyValid && qty.trim() !== "" && (
+              <span style={{ color: "var(--red)", fontSize: 12 }}>张数需为 1~1000 的整数</span>
+            )}
             {/* FR-W-02：approve 与 buy 两步独立状态 */}
             <button
               className="btn"
@@ -465,7 +573,15 @@ export default function Home() {
             </button>
             <button
               className="btn primary"
-              disabled={busy !== null || cost === 0n || needApprove}
+              disabled={
+                busy !== null ||
+                cost === 0n ||
+                needApprove ||
+                !current ||
+                current.state !== 1 ||
+                !salesOpen ||
+                chainNow >= current.closeTime
+              }
               onClick={() => act(`购买 ${qty} 张`, () => write(addresses.lottery, lotteryAbi, "buyTickets", [parseInt(qty, 10)]))}
             >
               {busy?.startsWith("购买") ? "购票中…" : `2️⃣ 购票（${fmt6(cost)}）`}
@@ -486,7 +602,9 @@ export default function Home() {
             <input value={injectAmt} onChange={(e) => setInjectAmt(e.target.value)} placeholder="注资额" />
             <button
               className="btn"
-              disabled={busy !== null}
+              disabled={
+                busy !== null || !current || current.state !== 1 || chainNow >= current.closeTime
+              }
               onClick={() =>
                 act(`注资 ${injectAmt} ${TOKEN.symbol}`, async () => {
                   // 用整数解析，避免 18 位精度下 JS Number 超出安全整数范围而失真（审计 Low）
@@ -582,33 +700,35 @@ export default function Home() {
 
         <section className="card">
           <h2>我的奖金</h2>
-          {rounds.filter((r) => r.state === 3 && r.myPending.some((x) => x > 0n)).length === 0 ? (
+          {claimable.length === 0 ? (
             <p style={{ color: "var(--muted)" }}>暂无可领取奖金。购票并开奖后，中奖会显示在这里。</p>
           ) : (
-            rounds
-              .filter((r) => r.state === 3 && r.myPending.some((x) => x > 0n))
-              .map((r) => (
-                <div key={r.id} style={{ marginBottom: 8 }}>
-                  <strong>第 {r.id} 期</strong>
-                  {r.myPending.map((amt, tier) =>
-                    amt > 0n ? (
-                      <div className="row" key={tier}>
-                        <span className="k">{TIER_NAMES[tier]}</span>
-                        <span className="v">
-                          {fmt6(amt)}{" "}
-                          <button
-                            className="btn primary"
-                            disabled={busy !== null}
-                            onClick={() => act(`领取第 ${r.id} 期${TIER_NAMES[tier]}`, () => write(addresses.lottery, lotteryAbi, "claim", [r.id, tier]))}
-                          >
-                            领奖
-                          </button>
-                        </span>
-                      </div>
-                    ) : null,
-                  )}
-                </div>
-              ))
+            claimable.map((c) => (
+              <div className="row" key={`${c.roundId}-${c.tier}`}>
+                <span className="k">
+                  第 {c.roundId} 期 · {TIER_NAMES[c.tier] ?? `T${c.tier}`}
+                  <br />
+                  <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                    领奖截止 {fmtTs(c.deadline)}
+                  </span>
+                </span>
+                <span className="v">
+                  {fmt6(c.amount)}{" "}
+                  <button
+                    className="btn primary"
+                    disabled={busy !== null}
+                    onClick={() =>
+                      act(`领取第 ${c.roundId} 期${TIER_NAMES[c.tier] ?? ""}`, async () => {
+                        await write(addresses.lottery, lotteryAbi, "claim", [c.roundId, c.tier]);
+                        await scanClaimable();
+                      })
+                    }
+                  >
+                    领奖
+                  </button>
+                </span>
+              </div>
+            ))
           )}
         </section>
 
@@ -628,7 +748,10 @@ export default function Home() {
           </div>
           <div className="row">
             <span className="k">售票状态</span>
-            <span className="v">{paused ? "⏸ 已暂停" : "▶ 正常"}</span>
+            <span className="v">
+              {salesOpen ? "▶ 本期可购票" : "⏸ 本期已禁售"}
+              {paused !== !salesOpen ? `（全局开关：${paused ? "暂停" : "正常"}，下期起生效）` : ""}
+            </span>
           </div>
           <div style={{ marginTop: 8 }}>
             <button

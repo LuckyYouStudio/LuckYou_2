@@ -66,9 +66,12 @@ contract LotteryCallbackGasTest is LotteryTestBase {
         assertGt(token.balanceOf(alice) - before, 0, "prize still claimable");
     }
 
-    /// @dev 构造器挡下回调预算不足的奖级配置
-    function test_RevertWhen_TierConfigExceedsCallbackBudget() public {
-        // 32 个奖级会让回调记账开销超预算（34k + 30k*32 > 1M）
+    /// @dev 构造器用 slot 总数上限（<=16）把回调成本限死。
+    ///      注意：这条测试此前叫「回调预算校验」，但 32 档配置实际撞的是 slots 闸，
+    ///      两条路共用同一个 selector，给了那条（永远不触发的）预算校验虚假绿灯，
+    ///      预算校验已因此移除（第四轮复查 M-4）
+    function test_RevertWhen_TierSlotsExceedCap() public {
+        // 32 档 × 1 名额 = 32 个 slot > 16
         uint16[] memory manyBps = new uint16[](32);
         uint8[] memory manyWinners = new uint8[](32);
         for (uint256 i = 0; i < 32; i++) {

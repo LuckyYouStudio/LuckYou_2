@@ -4,7 +4,7 @@
 // RPC 对 getLogs 区块范围有限制，因此按区块段分页查询。
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { isAddress, parseAbiItem, type Address } from "viem";
 import {
   ANVIL_ACCOUNTS,
@@ -51,13 +51,14 @@ export default function History() {
   const [claims, setClaims] = useState<ClaimRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // 地址输入每敲一键就重扫，慢的旧请求可能后返回并覆盖新地址的结果（审计第九轮 M1）
+  const reqRef = useRef(0);
 
   const load = useCallback(async () => {
-    if (!isAddress(account)) {
-      setBuys([]);
-      setClaims([]);
-      return;
-    }
+    const myReq = ++reqRef.current;
+    setBuys([]);
+    setClaims([]);
+    if (!isAddress(account)) return;
     setLoading(true);
     setError(null);
     try {
@@ -99,12 +100,14 @@ export default function History() {
           });
         }
       }
+      if (myReq !== reqRef.current) return; // 已被更新的查询取代，丢弃过期结果
       setBuys(buyRecords.reverse());
       setClaims(claimRecords.reverse());
     } catch (e) {
+      if (myReq !== reqRef.current) return;
       setError((e as Error).message.slice(0, 160));
     } finally {
-      setLoading(false);
+      if (myReq === reqRef.current) setLoading(false);
     }
   }, [account]);
 

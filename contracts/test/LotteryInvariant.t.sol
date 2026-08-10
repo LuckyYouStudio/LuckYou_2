@@ -21,6 +21,7 @@ contract LotteryHandler is Test {
     uint256 public totalInjected;
     uint256 public totalPrizesPaid;
     uint256 public totalFeesWithdrawn;
+    uint32[] internal drawingRounds;
 
     constructor(
         Lottery lottery_,
@@ -42,8 +43,11 @@ contract LotteryHandler is Test {
         address actor = actors[bound(actorSeed, 0, 2)];
         uint32 cur = lottery.s_currentRound();
         (Lottery.RoundState st, uint64 closeTime,,,,,,,) = lottery.getRound(cur);
+        // 用 salesOpenFor（开期快照）而非全局 s_salesPaused——后者在快照语义下是错的闸，
+        // 会让 handler 在当期本可购票时也跳过（第十轮红队 #6）
         if (
-            st != Lottery.RoundState.OPEN || block.timestamp >= closeTime || lottery.s_salesPaused()
+            st != Lottery.RoundState.OPEN || block.timestamp >= closeTime
+                || !lottery.salesOpenFor(cur)
         ) {
             return;
         }
@@ -59,8 +63,8 @@ contract LotteryHandler is Test {
     function inject(uint256 amount) external {
         amount = bound(amount, 1, 500e6);
         uint32 cur = lottery.s_currentRound();
-        (Lottery.RoundState st,,,,,,,,) = lottery.getRound(cur);
-        if (st != Lottery.RoundState.OPEN) return;
+        (Lottery.RoundState st, uint64 closeTime,,,,,,,) = lottery.getRound(cur);
+        if (st != Lottery.RoundState.OPEN || block.timestamp >= closeTime) return;
         token.mint(address(this), amount);
         token.approve(address(lottery), amount);
         lottery.injectPot(cur, amount);
@@ -72,7 +76,9 @@ contract LotteryHandler is Test {
         vm.warp(block.timestamp + secs);
     }
 
-    function drawAndFulfill(uint256 seed) external {
+    /// @dev 只触发开奖，**不**立即履约——否则不会有任何期停留在 DRAWING，
+    ///      retryDraw / fulfillPending 两条路径就永远是死代码（第十轮红队 #6）
+    function draw() external {
         uint32 cur = lottery.s_currentRound();
         (Lottery.RoundState st,, uint64 drawTime,,,,,,) = lottery.getRound(cur);
         if (st != Lottery.RoundState.OPEN) return;
@@ -80,12 +86,20 @@ contract LotteryHandler is Test {
             vm.warp(drawTime);
         }
         lottery.performUpkeep("");
-        (uint256 requestId,) = lottery.vrfRequestOf(cur);
-        if (requestId != 0) {
-            uint256[] memory words = new uint256[](1);
-            words[0] = seed;
-            coordinator.fulfillRandomWordsWithOverride(requestId, address(lottery), words);
-        }
+        if (drawingRounds.length < 32) drawingRounds.push(cur);
+    }
+
+    /// @dev 履约某个仍在 DRAWING 的期（可乱序，覆盖多请求并存的记账）
+    function fulfillPending(uint256 pick, uint256 seed) external {
+        if (drawingRounds.length == 0) return;
+        uint256 i = bound(pick, 0, drawingRounds.length - 1);
+        uint32 roundId = drawingRounds[i];
+        (uint256 requestId,) = lottery.vrfRequestOf(roundId);
+        if (requestId == 0) return;
+        uint256[] memory words = new uint256[](1);
+        words[0] = seed;
+        try coordinator.fulfillRandomWordsWithOverride(requestId, address(lottery), words) {}
+            catch {}
     }
 
     function claim(uint256 actorSeed, uint256 roundSeed, uint8 tier) external {
@@ -126,19 +140,6 @@ contract LotteryHandler is Test {
         uint32 cur = lottery.s_currentRound();
         uint32 roundId = uint32(bound(roundSeed, 1, cur));
         try lottery.retryDraw(roundId) {} catch {}
-    }
-
-    /// @dev 覆盖「旧请求迟到回调」：对任意期用任意 requestId 尝试回调，
-    ///      验证 state 闸在乱序下的稳健性
-    function lateFulfill(uint256 roundSeed, uint256 seed) external {
-        uint32 cur = lottery.s_currentRound();
-        uint32 roundId = uint32(bound(roundSeed, 1, cur));
-        (uint256 requestId,) = lottery.vrfRequestOf(roundId);
-        if (requestId == 0) return;
-        uint256[] memory words = new uint256[](1);
-        words[0] = seed;
-        try coordinator.fulfillRandomWordsWithOverride(requestId, address(lottery), words) {}
-            catch {}
     }
 }
 

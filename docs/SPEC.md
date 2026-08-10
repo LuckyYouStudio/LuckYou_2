@@ -157,11 +157,19 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   `s_pendingTier1` **MUST** 作为滚存资金的中转站。入口三处：过期滚存（FR-C-19）、
   未开出奖级的 carry（Q1）、超出配比被扣留的部分（FR-C-27）；出口唯一：
   `_openNextRound` 在开出新期时消费。
-  - **释放的两个前置条件**（缺一不可）：
-    1. **窗口完整度**：新期实际售票窗口 **MUST** 达到名义窗口的
-       `CARRY_WINDOW_COMPLETENESS_PCT`（80%）。`performUpkeep` 无权限、开期时刻由
-       调用者选，若不设此闸，攻击者可拖到临近场次才开期、在同一笔交易内买光独占
-    2. **配比**（FR-C-27）
+  - **释放受两道等比例约束**（都不是 0/1 阈值——阈值会造成永久冻结，本项目已踩过三次）：
+    1. **窗口完整度打折**：释放额 = 缓冲余额 × (实际售票窗口 / 名义窗口)，按 bps 计算。
+       `performUpkeep` 无权限、开期时刻由调用者选，攻击者可拖到临近场次才开期、
+       在同一笔交易内买光独占；打折使压缩窗口等比例削减本期可捕获额度。
+       **MUST NOT** 改回硬阈值：那会在 keeper 持续不及时时把缓冲卡死。
+       **MUST** 用 bps 而非百分比——百分比整数除法在名义窗口远大于实际窗口时
+       （正式日程「3 天」腿达 70.75 小时）会归零，等价于硬阈值
+    2. **自售额配比**（FR-C-27）
+  - VOIDED 期的资金 **MUST** 同样经缓冲区转出，**MUST NOT** 直接注入下一期——
+    否则攻击者可让期空转、再在压缩窗口时触发 VOID，使整包 carry 绕过打折规则
+  - 事件语义：资金进缓冲发 `PrizeRolledOver(fromRound, 0, amount)`（`toRound` 恒为 0，
+    因为打折释放可能分多期落地、此刻去向未定）；真正释放发
+    `CarryReleased(toRound, potAmount, tier1Amount)`
   - 缓冲区余额 **MUST** 计入偿付性不变量（FR-T-03）
   - 因 FR-C-10「开奖即开下一期」，某期结算产生的 carry 实际落在**再下一个新开出的期**，
     而非紧邻的下一期
@@ -186,8 +194,9 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   `injectPot(uint32 roundId, uint256 amount)`，任何人可向处于 OPEN 状态的期
   注入 token，全额计入该期 pot、不抽成，SafeERC20 收款并 emit `PotInjected`。
   注入只进不出，**MUST NOT** 存在对应的取回函数（与 FR-C-24 一致）。
-  若该期最终 VOIDED（零购票），已注入金额 **MUST** 滚入下期奖池并
-  emit `PrizeRolledOver`
+  若该期最终 VOIDED（零购票），已注入金额 **MUST** 经滚存缓冲区转出（FR-C-28），
+  emit `PrizeRolledOver(roundId, 0, amount)`；其后按窗口完整度打折释放到新期。
+  **MUST NOT** 直接注入下一期（会被「让期空转 + 压缩窗口触发 VOID」绕过打折规则）
   - 验收：注资后该期 pot 增加、`accruedFees` 不变；VOIDED 期的注资滚入下期
 
 ### 4.6 权限与暂停
@@ -209,11 +218,21 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   - 验收：已开出的期被暂停后，他人仍可购票；下一期开出时对所有人（含 owner）一律禁售
 - **FR-C-24** **MUST NOT** 存在任何形式的 `emergencyWithdraw` / `sweep` /
   `rescueTokens`，能动到未领奖金。
-  - **外部信任方披露（2026-08-10 安全自查 C）**：合约依赖的 Chainlink VRF 订阅
-    由订阅所有者掌控。订阅所有者 `removeConsumer` 或撤走 LINK 会使 `performUpkeep`
-    与 `retryDraw` 的 VRF 请求失败，已进 DRAWING 的期将无法结算、其奖池被冻结，
-    且合约**刻意不提供**任何行政解冻手段（否则即违反本条）。这是使用 VRF 订阅模式的
-    固有信任假设，非合约缺陷；主网运营须由可信主体（多签）持有订阅并维持 LINK 余额
+  - **外部信任方披露（2026-08-10 自查 C，第十轮红队修订）**：以下两类外部依赖
+    可使资金无法取出，而合约**刻意不提供**任何行政解冻手段（否则即违反本条）：
+    1. **VRF 订阅所有者**。撤走 LINK：请求仍会成功，仅该期停在 DRAWING（`retryDraw`
+       可救），影响面为单期。`removeConsumer`：请求失败——**VRF 请求已用 try/catch
+       与开期解耦**（第十轮 #1 修复），所以最坏是该期停在 DRAWING 并 emit
+       `DrawRequestFailed`，新期照常开出、彩票继续运转；恢复 consumer 后
+       任何人可 `retryDraw` 救回。修复前此路径会让期号永不推进、全部资金永久冻结
+    2. **计价 token 发行方**。Base USDC 是可升级、可暂停、可黑名单的代理。
+       **若合约地址被列入黑名单，买票/领奖/提抽成同时失效，且无救援手段**；
+       若 USDC 暂停超过 90 天，领奖窗口是纯墙钟计时，中奖者会在无法转账期间过期。
+       这不是理论风险，而是无牌照链上彩票面临的现实监管动作面（Q7 合规评估的一部分）
+  - **「只有入口没有出口」的结构性权衡**：资金离开合约仅两条路——中奖者 `claim`
+    与运营 `withdrawFees`。FR-C-24 用「管理员偷钱」的风险换取了「极端情况下
+    所有人都拿不回钱」的风险。主网前**应当**评估是否加入一条不含自由裁量权的
+    逃生通道（如「长期无法开奖后任何人可作废并按购票额原路退款」）
 
 ### 4.7 事件
 
@@ -224,6 +243,10 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   PotInjected(uint32 indexed roundId, address indexed sender, uint256 amount)
   DrawRequested(uint32 indexed roundId, uint256 indexed requestId)
   DrawSettled(uint32 indexed roundId, uint256 seed, uint32 ticketCount, uint256[] perWinnerAmounts)
+  TierConfigSet(uint16[] tierBps, uint8[] winnerCounts)   // 构造时一次性，slot→奖级 映射所需
+  CarryReleased(uint32 indexed toRound, uint256 potAmount, uint256 tier1Amount)
+  CarryWithheld(uint32 indexed roundId, uint256 amount)
+  DrawRequestFailed(uint32 indexed roundId)
   PrizeClaimed(uint32 indexed roundId, address indexed winner, uint8 tier, uint256 amount)
   PrizeRolledOver(uint32 indexed fromRound, uint32 indexed toRound, uint256 amount)
   RoundVoided(uint32 indexed roundId)

@@ -92,6 +92,7 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     error InvalidTierConfig();
     error NoFeesToWithdraw();
     error CoordinatorTampered();
+    error OnlySelf();
 
     // ===== 事件（FR-C-25）=====
 
@@ -108,7 +109,12 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         uint32 indexed roundId, uint256 seed, uint32 ticketCount, uint256[] perWinnerAmounts
     );
     event PrizeClaimed(uint32 indexed roundId, address indexed winner, uint8 tier, uint256 amount);
+    /// @notice 资金离开某期进入滚存缓冲区（FR-C-28）。
+    ///         `toRound` 恒为 0——因为释放是按窗口完整度打折的，这笔钱可能分几期才流出，
+    ///         在此刻无法确定去向。真正的去向由 CarryReleased 事件给出
     event PrizeRolledOver(uint32 indexed fromRound, uint32 indexed toRound, uint256 amount);
+    /// @notice 缓冲区资金释放进新开出的期（与 PrizeRolledOver 配对，可精确重建资金流）
+    event CarryReleased(uint32 indexed toRound, uint256 potAmount, uint256 tier1Amount);
     event RoundVoided(uint32 indexed roundId);
     event FeesWithdrawn(address indexed treasury, uint256 amount);
     event TreasuryUpdated(address indexed treasury);
@@ -116,6 +122,12 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     event SalesPausedUpdated(bool paused);
     /// @notice carry 超出本期自售额配比的部分被扣留、顺延到后续期（FR-C-27）
     event CarryWithheld(uint32 indexed roundId, uint256 amount);
+    /// @notice 构造时一次性广播奖级配置。DrawSettled 只带 seed 与各档金额，
+    ///         而 slot→奖级 的映射依赖 winnerCounts；没有这个事件，
+    ///         纯事件重建器就无法把中奖位归到正确奖级（FR-C-25）
+    event TierConfigSet(uint16[] tierBps, uint8[] winnerCounts);
+    /// @notice VRF 请求失败（订阅问题等）。本期留在 DRAWING 待 retryDraw，不阻塞新期开出
+    event DrawRequestFailed(uint32 indexed roundId);
 
     // ===== 常量 =====
 
@@ -141,13 +153,6 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     ///         抽签制彩票的固有性质，攻击者的本金也会随中奖回到自己手里。
     ///         配比只抬高资本门槛并给其他参与者稀释的机会
     uint256 public constant CARRY_MATCH_MULTIPLIER = 1;
-    /// @dev 缓冲释放量按「售票窗口完整度」等比例打折：
-    ///      释放额 = 缓冲余额 × (实际窗口 / 名义窗口)。
-    ///      `performUpkeep` 无权限、开期时刻由调用者选，攻击者可故意拖到临近下一场次
-    ///      才开期使窗口极短、再在同一笔交易里买光独占（第四轮结构性发现）；打折后
-    ///      压缩窗口会等比例削减本期可捕获的额度。
-    ///      **刻意不用 0/1 阈值**：那会在 keeper 持续不及时时把缓冲永久卡死，
-    ///      与「阶跃门槛导致永久冻结」是同一个坑（本轮自查实测复现）
     uint64 public constant DRAW_TIMEOUT = 3 hours; // FR-C-14
     uint64 public constant CLAIM_WINDOW = 90 days; // FR-C-19
     uint16 public constant BPS_DENOMINATOR = 10000;
@@ -238,10 +243,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
             slots += tierWinnerCounts[i];
         }
         if (bpsSum != BPS_DENOMINATOR || slots > 16) revert InvalidTierConfig();
-        // 回调 gas 预算校验：仅限制 slots<=16 不够——回调内每奖级一次冷 SSTORE，
-        // 若将来回调再变重，高奖级数配置可能撑爆 VRF_CALLBACK_GAS 使该期永久卡在
-        // DRAWING（审计第四轮）。此处按实测斜率留足余量，把不可运行的配置挡在部署前
-        if (34_000 + 30_000 * tierBps.length > VRF_CALLBACK_GAS) revert InvalidTierConfig();
+        // 注：曾在此加过「回调 gas 预算」校验，但 slots <= 16 已蕴含
+        // tierBps.length <= 16（每档名额 >= 1），预算上界恒为 514k < 1M，
+        // 那条校验永远不触发、只制造虚假安全感，已移除（第四轮复查 M-4）。
+        // 回调 gas 的真正保障是：中奖人派生已移出回调，其成本与 range 数无关
 
         i_token = IERC20(token);
         i_ticketPrice = ticketPrice;
@@ -254,8 +259,9 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         s_tierWinnerCounts = tierWinnerCounts;
         s_intervals = intervals;
         s_lastSlotTime = anchorTime;
+        emit TierConfigSet(tierBps, tierWinnerCounts);
 
-        _openNextRound(0, 0);
+        _openNextRound();
     }
 
     // ===== 购票与注资 =====
@@ -326,28 +332,39 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         }
 
         if (r.ticketCount == 0) {
-            // FR-C-08：零购票直接作废；注资与滚存承接额转入下期（FR-C-26）
+            // FR-C-08：零购票直接作废。其资金**必须经缓冲区**转出（FR-C-28），
+            // 不能直接注入下一期——否则攻击者可让期空转、再在压缩窗口时触发 VOID，
+            // 让整包 carry 绕过按窗口打折的释放规则进入他能独占的短窗口期（第四轮复查）
             r.state = RoundState.VOIDED;
-            uint256 carryPot = r.pot;
-            uint256 carryT1 = r.tier1Carry;
+            uint256 voided = r.pot + r.tier1Carry;
+            s_pendingPot += r.pot;
+            s_pendingTier1 += r.tier1Carry;
             r.pot = 0;
             r.tier1Carry = 0;
+            r.carriedPot = 0; // 同步清零，避免 carriedPotOf 对 VOIDED 期报告已转走的钱
             emit RoundVoided(roundId);
-            uint32 nextId = _openNextRound(carryPot, carryT1);
-            if (carryPot + carryT1 > 0) {
-                emit PrizeRolledOver(roundId, nextId, carryPot + carryT1);
+            if (voided > 0) {
+                emit PrizeRolledOver(roundId, 0, voided);
             }
+            _openNextRound();
             return;
         }
 
         r.state = RoundState.DRAWING;
         r.drawRequestedAt = uint64(block.timestamp);
-        uint256 requestId = _requestRandomWords();
-        r.vrfRequestId = requestId;
-        s_requestToRound[requestId] = roundId;
-        emit DrawRequested(roundId, requestId);
+        // VRF 请求失败**不得**让整笔交易回滚：否则订阅被 removeConsumer 或 coordinator
+        // 层失效时，_openNextRound 也一起失败 → 期号永不推进 → 全部资金（含缓冲区）
+        // 永久冻结，而 FR-C-24 禁止任何救援手段。隔离后最坏只是本期卡在 DRAWING
+        // （3 小时后任何人可 retryDraw），彩票本身继续运转（第十轮红队 #1）
+        try this.requestRandomWordsSelf() returns (uint256 requestId) {
+            r.vrfRequestId = requestId;
+            s_requestToRound[requestId] = roundId;
+            emit DrawRequested(roundId, requestId);
+        } catch {
+            emit DrawRequestFailed(roundId);
+        }
 
-        _openNextRound(0, 0);
+        _openNextRound();
     }
 
     /// @notice VRF 超时兜底：距上次请求满 DRAW_TIMEOUT 后任何人可重新请求（FR-C-14）
@@ -423,7 +440,7 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         if (carryOut > 0) {
             // 修复 A：入缓冲，由下一新期消费，不注入可能已封盘的当前期
             s_pendingTier1 += carryOut;
-            emit PrizeRolledOver(roundId, s_currentRound + 1, carryOut);
+            emit PrizeRolledOver(roundId, 0, carryOut); // 进缓冲，去向由 CarryReleased 给出
         }
 
         // FR-C-16：回调内只做记账。中奖人由 seed 完全决定，可离线/经 winnersOf 派生，
@@ -494,7 +511,7 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         // 修复 A：入缓冲，由下一新期消费。绝不注入 s_currentRound——它可能正处于
         // 封盘期、票已冻结，攻击者可预先卡位为唯一买家从而确定性独占这笔过期奖金
         s_pendingPot += unclaimed;
-        emit PrizeRolledOver(roundId, s_currentRound + 1, unclaimed);
+        emit PrizeRolledOver(roundId, 0, unclaimed); // 进缓冲，去向由 CarryReleased 给出
     }
 
     /// @notice 把已分账的运营抽成全额转给 treasury。任何人可触发，资金只会去 treasury
@@ -535,6 +552,24 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     /// @notice 本期是否可购票（开期时的暂停快照）
     function salesOpenFor(uint32 roundId) external view returns (bool) {
         return !s_rounds[roundId].salesPausedAtOpen;
+    }
+
+    /// @notice 本期实际生效的抽成（开期快照）。全局 s_feeBps 只对此后开出的期生效，
+    ///         前端必须用这个值展示，否则会对当期购票者误述费率
+    function feeBpsOf(uint32 roundId) external view returns (uint16) {
+        return s_rounds[roundId].feeBpsAtOpen;
+    }
+
+    /// @notice 本期结算时实际可分配的上限估算（配比释放后，FR-C-27）。
+    ///         前端应展示此值而非原始 pot——两者在大额滚存 + 低参与度时可差数量级
+    function distributableEstimate(uint32 roundId) external view returns (uint256) {
+        Round storage r = s_rounds[roundId];
+        uint256 selfSold = r.pot - r.carriedPot;
+        uint256 budget = selfSold * CARRY_MATCH_MULTIPLIER;
+        uint256 releasable = r.carriedPot < budget ? r.carriedPot : budget;
+        budget -= releasable;
+        uint256 tier1Releasable = r.tier1Carry < budget ? r.tier1Carry : budget;
+        return selfSold + releasable + tier1Releasable;
     }
 
     /// @notice 本期 pot 中「非本期自售」的部分（滚存承接 + 注资），受参与度门槛保护
@@ -669,8 +704,9 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         TicketRange[] storage all = s_ranges[roundId];
         uint256 total = all.length;
         if (offset >= total) return new TicketRange[](0);
-        uint256 end = offset + limit;
-        if (end > total) end = total;
+        // 不能写 offset + limit：limit = type(uint256).max 是「读到底」的自然写法，
+        // 直接相加会溢出 panic（第四轮复查 L-2）
+        uint256 end = limit > total - offset ? total : offset + limit;
         page = new TicketRange[](end - offset);
         for (uint256 i = offset; i < end; i++) {
             page[i - offset] = all[i];
@@ -715,13 +751,13 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         }
         if (withheldPot + withheldTier1 > 0) {
             emit CarryWithheld(roundId, withheldPot + withheldTier1);
-            emit PrizeRolledOver(roundId, s_currentRound + 1, withheldPot + withheldTier1);
+            emit PrizeRolledOver(roundId, 0, withheldPot + withheldTier1);
         }
         return (pot, tier1CarryIn);
     }
 
     /// @dev 开启下一期：closeTime 取日程中晚于当前时刻的最近场次（跳过已错过的场次，Q2）
-    function _openNextRound(uint256 carryPot, uint256 carryTier1) private returns (uint32 newId) {
+    function _openNextRound() private returns (uint32 newId) {
         uint64 prevSlot = s_lastSlotTime;
         uint64 t = prevSlot;
         uint32 cursor = s_intervalCursor;
@@ -751,26 +787,46 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         uint64 prevDraw = prevSlot + SEAL_GAP;
         uint256 nominal = t > prevDraw ? t - prevDraw : 0;
         uint256 actual = t > block.timestamp ? t - block.timestamp : 0;
-        uint256 pct = nominal == 0 ? 100 : (actual * 100) / nominal;
-        if (pct > 100) pct = 100;
+        // 用 bps 而非百分比：整数除法在 nominal 远大于 actual 时会归零，
+        // 而正式日程「3 天」那一腿 nominal 达 70.75 小时，只要 keeper 稍晚
+        // 就会算出 0%、缓冲一分不出——这正是要避免的冻结（第四轮复查 M-1）
+        uint256 pctBps = nominal == 0 ? 10000 : (actual * 10000) / nominal;
+        if (pctBps > 10000) pctBps = 10000;
 
-        r.pot = carryPot;
-        r.tier1Carry = carryTier1;
-        // 按窗口完整度**打折**释放，而不是 0/1 门：
+        r.pot = 0;
+        r.tier1Carry = 0;
+        // 缓冲释放量按「售票窗口完整度」等比例打折：释放额 = 缓冲 × (实际窗口/名义窗口)。
+        // performUpkeep 无权限、开期时刻由调用者选，攻击者可拖到临近下一场次才开期使窗口
+        // 极短、再在同一笔交易里买光独占；打折使压缩窗口等比例削减可捕获额度。
+        // **刻意不用 0/1 阈值**：
         // 0/1 门在 keeper 持续不及时时会让缓冲永远出不来（自查实测：6 期未释放），
         // 与上一轮「阶跃门槛导致永久冻结」是同一个坑。打折后压缩窗口只会减少本期
         // 可释放的额度（削弱择时独占的收益），而不会把资金卡死
-        if (pct > 0) {
-            uint256 releasePot = (s_pendingPot * pct) / 100;
-            uint256 releaseTier1 = (s_pendingTier1 * pct) / 100;
+        if (pctBps > 0) {
+            uint256 releasePot = (s_pendingPot * pctBps) / 10000;
+            uint256 releaseTier1 = (s_pendingTier1 * pctBps) / 10000;
+            // 防粉尘冻结：余额极小时按比例仍会取整为 0，此时窗口过半就全额放行
+            if (releasePot == 0 && s_pendingPot > 0 && pctBps >= 5000) releasePot = s_pendingPot;
+            if (releaseTier1 == 0 && s_pendingTier1 > 0 && pctBps >= 5000) {
+                releaseTier1 = s_pendingTier1;
+            }
             r.pot += releasePot;
             r.tier1Carry += releaseTier1;
             s_pendingPot -= releasePot;
             s_pendingTier1 -= releaseTier1;
+            if (releasePot + releaseTier1 > 0) {
+                emit CarryReleased(newId, releasePot, releaseTier1);
+            }
         }
         // 开期时 pot 全部来自 carry（本期尚无自售），据此建立配比释放的基线
         r.carriedPot = r.pot;
         emit RoundOpened(newId, t);
+    }
+
+    /// @notice 仅供本合约自调用，用于把 VRF 请求包进 try/catch。外部调用一律拒绝
+    function requestRandomWordsSelf() external returns (uint256) {
+        if (msg.sender != address(this)) revert OnlySelf();
+        return _requestRandomWords();
     }
 
     /// @dev 请求恒发往构造时钉死的 coordinator，不受 setCoordinator 影响
