@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {Script, console} from "forge-std/Script.sol";
+import {VmSafe} from "forge-std/Vm.sol";
 import {Lottery} from "../src/Lottery.sol";
 
 /// @notice 正式网络部署脚本（FR-D-01）：按 block.chainid 区分 Base Sepolia 与 Base 主网。
@@ -31,11 +32,18 @@ contract Deploy is Script {
 
         // 双色球日程：锚点取最近一个已过去的周二 12:00 UTC（北京时间 20:00 停售），
         // 间隔循环 [2 天, 3 天, 2 天] → 周二/周四/周日（SPEC 第 9 节 Q2）。
-        // 设置 FAST_INTERVAL_SECONDS（须 > 75 分钟封盘期，如 7200）可部署快节奏
-        // 验证实例，用于在数小时内跑通真实 VRF + Automation 全链路
+        // 设置 FAST_INTERVAL_SECONDS 可部署快节奏验证实例（仅测试网，见下方 require）。
+        // 取值须 > SEAL_GAP + MIN_SALES_WINDOW = 6300 秒（105 分钟），推荐 7200。
+        // 注意：日程在构造时定死、全合约无 setter，配错只能重新部署
         uint64 anchor;
         uint32[] memory intervals;
         uint256 fastInterval = vm.envOr("FAST_INTERVAL_SECONDS", uint256(0));
+        // 快节奏日程仅限测试网：日程在构造时定死且无 setter，若 .env 里残留这一行
+        // 就把主网部署成 2 小时循环，将永久无法修复（审计第四轮 D-1）
+        require(fastInterval == 0 || block.chainid == 84532, "FAST_INTERVAL_SECONDS: testnet only");
+        // 合约要求 interval > SEAL_GAP + MIN_SALES_WINDOW = 75min + 30min = 6300 秒
+        require(fastInterval == 0 || fastInterval > 6300, "FAST_INTERVAL_SECONDS: must exceed 6300");
+        require(fastInterval <= type(uint32).max, "FAST_INTERVAL_SECONDS: overflows uint32");
         if (fastInterval > 0) {
             anchor = uint64(block.timestamp);
             intervals = new uint32[](1);
@@ -75,8 +83,9 @@ contract Deploy is Script {
         );
         vm.stopBroadcast();
 
-        // 写前端配置（仅测试网；主网前端配置应人工审核后更新）
-        if (block.chainid == 84532) {
+        // 写前端配置（仅测试网；主网前端配置应人工审核后更新）。
+        // 仅在真实广播时写：dry run 也覆写会把前端指向一个从未部署的地址（审计第四轮 D-12）
+        if (block.chainid == 84532 && vm.isContext(VmSafe.ForgeContext.ScriptBroadcast)) {
             string memory json = "deployment";
             vm.serializeUint(json, "chainId", block.chainid);
             vm.serializeUint(json, "startBlock", block.number);
@@ -92,7 +101,11 @@ contract Deploy is Script {
         console.log("==============================================");
         console.log(unicode"部署完成：", cfg.name);
         console.log("Lottery:", address(lottery));
-        console.log(unicode"首期停售时间（unix）:", _firstClose(anchor, intervals));
+        // 直接读实例状态，而非在脚本里重算日程——重算过 MIN_SALES_WINDOW 这一关时
+        // 会与合约结论不一致（审计第四轮 D-11）
+        (, uint64 firstCloseTime, uint64 firstDrawTime,,,,,,) = lottery.getRound(1);
+        console.log(unicode"首期停售时间（unix）:", firstCloseTime);
+        console.log(unicode"首期开奖时间（unix）:", firstDrawTime);
         console.log("==============================================");
         console.log(unicode"待办清单（缺一不可，否则无法开奖）：");
         console.log(unicode"  1. 在 https://vrf.chain.link 打开订阅", subId);
@@ -136,15 +149,5 @@ contract Deploy is Script {
             tuesdayNoon -= 7 days; // 今天恰是周二且未到 12:00
         }
         return uint64(tuesdayNoon);
-    }
-
-    function _firstClose(uint64 anchor, uint32[] memory intervals) internal view returns (uint256) {
-        uint256 t = anchor;
-        uint256 i = 0;
-        while (t <= block.timestamp) {
-            t += intervals[i];
-            i = (i + 1) % intervals.length;
-        }
-        return t;
     }
 }

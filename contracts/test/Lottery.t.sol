@@ -100,6 +100,11 @@ contract LotteryTestBase is Test {
         (,,,,, carry,,,) = lottery.getRound(roundId);
     }
 
+    /// @dev 结算时刻（领奖窗口自此起算，审计第四轮）
+    function _settledAtOf(uint32 roundId) internal view returns (uint64 settledAt) {
+        (settledAt,) = lottery.claimDeadlineOf(roundId);
+    }
+
     /// @dev 快进到开奖时刻并触发 performUpkeep
     function _triggerDraw(uint32 roundId) internal {
         vm.warp(_drawTimeOf(roundId));
@@ -121,7 +126,7 @@ contract LotteryTestBase is Test {
 
     /// @dev 线性扫描对照实现（用于 fuzz 验证二分查找）
     function _linearOwnerOf(uint32 roundId, uint32 ticketId) internal view returns (address) {
-        Lottery.TicketRange[] memory ranges = lottery.getRanges(roundId);
+        Lottery.TicketRange[] memory ranges = lottery.getRanges(roundId, 0, type(uint256).max);
         for (uint256 i = 0; i < ranges.length; i++) {
             if (ticketId >= ranges[i].start && ticketId < ranges[i].end) {
                 return ranges[i].owner;
@@ -203,7 +208,7 @@ contract LotteryBuyTest is LotteryTestBase {
         assertEq(_potOf(1), 99e6, "pot");
         assertEq(lottery.s_accruedFees(), 1e6, "fees");
         assertEq(token.balanceOf(address(lottery)), 100e6, "balance");
-        Lottery.TicketRange[] memory ranges = lottery.getRanges(1);
+        Lottery.TicketRange[] memory ranges = lottery.getRanges(1, 0, type(uint256).max);
         assertEq(ranges.length, 1);
         assertEq(ranges[0].start, 0);
         assertEq(ranges[0].end, 100);
@@ -215,7 +220,7 @@ contract LotteryBuyTest is LotteryTestBase {
         _buy(alice, 10);
         _buy(bob, 5);
         _buy(alice, 3); // Q3：同址多次购票，产生多个 Range
-        Lottery.TicketRange[] memory ranges = lottery.getRanges(1);
+        Lottery.TicketRange[] memory ranges = lottery.getRanges(1, 0, type(uint256).max);
         assertEq(ranges.length, 3);
         assertEq(ranges[1].start, 10);
         assertEq(ranges[1].end, 15);
@@ -512,7 +517,7 @@ contract LotterySettleClaimTest is LotteryTestBase {
     function test_RevertWhen_ClaimAfterWindow() public {
         _setupSettledRound100();
         (, address[] memory winners,) = lottery.winnersOf(1);
-        vm.warp(_closeTimeOf(1) + 90 days + 1);
+        vm.warp(_settledAtOf(1) + 90 days + 1);
         vm.prank(winners[0]);
         vm.expectRevert(Lottery.ClaimWindowClosed.selector);
         lottery.claim(1, 0);
@@ -523,7 +528,7 @@ contract LotterySettleClaimTest is LotteryTestBase {
     ///      由下一新期消费。滚存进封盘期的攻击回归见 LotteryCarryTiming.t.sol
     function test_RolloverExpired_BuffersUnclaimed() public {
         _setupSettledRound100();
-        vm.warp(_closeTimeOf(1) + 90 days + 1);
+        vm.warp(_settledAtOf(1) + 90 days + 1);
 
         vm.prank(makeAddr("anyone"));
         lottery.rolloverExpired(1);

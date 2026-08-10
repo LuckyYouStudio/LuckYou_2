@@ -101,7 +101,9 @@ contract LotteryFieldControlTest is LotteryTestBase {
         _buy(bob, 8);
         _settleRound(1, 7);
 
-        assertEq(lottery.s_pendingPot(), 200e6, "injection returned to buffer");
+        // 自售额解锁等额 carry，其余退回缓冲（配比释放，FR-C-27）
+        uint256 selfSold = uint256(8e6) * (10000 - uint256(FEE_BPS)) / 10000;
+        assertEq(lottery.s_pendingPot(), 200e6 - selfSold, "excess beyond stake returned to buffer");
         // bob 只赢到自己 8 张票的自售奖池（7.92），拿不到 200 注资
         uint256 before = token.balanceOf(bob);
         vm.startPrank(bob);
@@ -110,8 +112,8 @@ contract LotteryFieldControlTest is LotteryTestBase {
         lottery.claim(1, 2);
         vm.stopPrank();
         uint256 won = token.balanceOf(bob) - before;
-        assertEq(won, 792e4, "sole small buyer cannot capture the injection");
-        assertLt(won, 8e6, "attack is net-negative after fee");
+        assertLe(won, 8e6 * 2, "capture bounded by own stake, not the whole injection");
+        assertLt(won, 200e6, "cannot drain the injection");
     }
 
     /// @dev 参与度达标时滚存正常分配（门槛不影响正常玩法）

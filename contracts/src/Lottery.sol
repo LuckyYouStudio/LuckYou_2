@@ -54,7 +54,9 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         uint16 claimedBits; // 中奖 slot 领取位图（slot 总数 ≤ 16）
         bool expiredRolled; // 过期未领奖金是否已滚存
         bool salesPausedAtOpen; // 开期时的暂停状态快照（修复：见 setSalesPaused）
+        uint16 feeBpsAtOpen; // 开期时的抽成快照，防 owner 抢跑购票临时抬高费率
         uint64 drawRequestedAt;
+        uint64 settledAt; // 结算时刻；领奖窗口自此起算，避免结算延迟吃掉窗口
         uint256 pot; // 本期可分配奖金（购票分账 + 注资 + 承接的过期滚存）
         uint256 carriedPot; // pot 中「非本期自售」的部分（滚存承接 + 注资），受参与度门槛保护
         uint256 tier1Carry; // 上期滚入、计入本期一等奖份额的金额（Q1 双色球逻辑）
@@ -99,8 +101,11 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     );
     event PotInjected(uint32 indexed roundId, address indexed sender, uint256 amount);
     event DrawRequested(uint32 indexed roundId, uint256 indexed requestId);
-    event WinnersPicked(
-        uint32 indexed roundId, uint32[] winningTickets, address[] winners, uint8[] tiers
+    /// @notice 开奖结算。中奖票号由 `keccak256(seed, slot) % ticketCount` 完全决定，
+    ///         中奖人可由 TicketsBought 事件离线还原（或调 winnersOf 视图）——
+    ///         这保持了 FR-C-25「仅靠事件重建全部历史」，同时让 VRF 回调保持 O(奖级数)
+    event DrawSettled(
+        uint32 indexed roundId, uint256 seed, uint32 ticketCount, uint256[] perWinnerAmounts
     );
     event PrizeClaimed(uint32 indexed roundId, address indexed winner, uint8 tier, uint256 amount);
     event PrizeRolledOver(uint32 indexed fromRound, uint32 indexed toRound, uint256 amount);
@@ -109,6 +114,8 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     event TreasuryUpdated(address indexed treasury);
     event FeeBpsUpdated(uint16 feeBps);
     event SalesPausedUpdated(bool paused);
+    /// @notice carry 超出本期自售额配比的部分被扣留、顺延到后续期（FR-C-27）
+    event CarryWithheld(uint32 indexed roundId, uint256 amount);
 
     // ===== 常量 =====
 
@@ -118,9 +125,29 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     /// @notice 新期最短售票窗口。performUpkeep 无权限、任何人可择时调用，若不设下限，
     ///         调用者可卡在下一场次前 1 秒开期，使新期只有极短窗口供自己独占（审计第三轮 #2）
     uint64 public constant MIN_SALES_WINDOW = 30 minutes;
-    /// @notice 滚存/注资资金的最低参与度门槛：本期票数不足时这部分不予分配，退回缓冲区
-    ///         顺延到后续期。用于抬高「独占滚存」的资本门槛（审计第三轮 #1/#2 缓解）
-    uint32 public constant MIN_TICKETS_FOR_CARRY = 100;
+    /// @notice 滚存/注资资金的释放配比（FR-C-27）：本期可分配的 carry 上限 =
+    ///         本期自售净额 × 此倍数，超出部分退回缓冲顺延。
+    ///
+    ///         为什么是「按自售额配比」而不是「票数达标就全放」：
+    ///         - 阶跃门槛可被恰好买满门槛票数的人一次性独占整包 carry，
+    ///           捕获成本与 carry 规模无关（O(1)），carry 越滚越大反而越划算；
+    ///         - 若再加「连续扣留 N 期后强制放行」的逃生阀，攻击者只需用最小额度
+    ///           把计数器攒满，成本进一步降到几张票（审计第四轮 Critical）。
+    ///         按配比后，想拿走 X 的 carry 就必须自掏至少 X/倍数 的票款，
+    ///         资本门槛与捕获量线性挂钩；同时只要有人买票就会释放相应额度，
+    ///         carry 不会像阶跃门槛那样在低参与度下被永久冻结。
+    ///
+    ///         **诚实的局限**：这仍不能消除捕获——买光全场即可拿走全部奖池是
+    ///         抽签制彩票的固有性质，攻击者的本金也会随中奖回到自己手里。
+    ///         配比只抬高资本门槛并给其他参与者稀释的机会
+    uint256 public constant CARRY_MATCH_MULTIPLIER = 1;
+    /// @notice 释放缓冲所要求的「售票窗口完整度」下限（百分比）。
+    ///         `performUpkeep` 无权限、开期时刻由调用者选，攻击者可故意拖到临近下一场次
+    ///         才开期，使新期只剩最短窗口，再在同一笔交易里买光——第三、四轮的多项修复
+    ///         都是被这条路径在单笔交易内绕开的（审计第四轮结构性发现）。
+    ///         要求实际窗口达到名义窗口的此比例，缓冲才随新期释放；否则继续留在缓冲，
+    ///         等一个由及时 keeper 开出的、拥有完整窗口的期
+    uint256 public constant CARRY_WINDOW_COMPLETENESS_PCT = 80;
     uint64 public constant DRAW_TIMEOUT = 3 hours; // FR-C-14
     uint64 public constant CLAIM_WINDOW = 90 days; // FR-C-19
     uint16 public constant BPS_DENOMINATOR = 10000;
@@ -211,6 +238,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
             slots += tierWinnerCounts[i];
         }
         if (bpsSum != BPS_DENOMINATOR || slots > 16) revert InvalidTierConfig();
+        // 回调 gas 预算校验：仅限制 slots<=16 不够——回调内每奖级一次冷 SSTORE，
+        // 若将来回调再变重，高奖级数配置可能撑爆 VRF_CALLBACK_GAS 使该期永久卡在
+        // DRAWING（审计第四轮）。此处按实测斜率留足余量，把不可运行的配置挡在部署前
+        if (34_000 + 30_000 * tierBps.length > VRF_CALLBACK_GAS) revert InvalidTierConfig();
 
         i_token = IERC20(token);
         i_ticketPrice = ticketPrice;
@@ -244,7 +275,9 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
 
         uint32 start = r.ticketCount;
         uint256 cost = i_ticketPrice * quantity;
-        uint256 fee = (cost * s_feeBps) / BPS_DENOMINATOR;
+        // 用开期快照而非实时费率：否则 owner 可抢跑大额购票临时把 1% 抬到 10%，
+        // 差额从奖池里吃走（审计第四轮，与 salesPausedAtOpen 同构）
+        uint256 fee = (cost * r.feeBpsAtOpen) / BPS_DENOMINATOR;
         r.pot += cost - fee;
         s_accruedFees += fee;
         r.ticketCount = start + quantity;
@@ -357,23 +390,11 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
 
         uint256 pot = r.pot;
         uint256 tier1CarryIn = r.tier1Carry;
-        // 参与度门槛（审计第三轮）：本期票数不足时，滚存承接与注资的钱不予分配，
-        // 原样退回缓冲区顺延，只分配本期自售所得。这抬高了「独占滚存」所需的资本，
-        // 使「买最少的票吃掉整包滚存」不再划算
-        if (r.ticketCount < MIN_TICKETS_FOR_CARRY) {
-            uint256 heldBack = r.carriedPot;
-            if (heldBack > 0) {
-                s_pendingPot += heldBack;
-                pot -= heldBack;
-            }
-            if (tier1CarryIn > 0) {
-                s_pendingTier1 += tier1CarryIn;
-                tier1CarryIn = 0;
-            }
-            if (heldBack + r.tier1Carry > 0) {
-                emit PrizeRolledOver(roundId, s_currentRound + 1, heldBack + r.tier1Carry);
-            }
-        }
+        // 滚存/注资的释放配比（FR-C-27）：本期可分配的 carry 上限 = 本期自售净额 ×
+        // CARRY_MATCH_MULTIPLIER，超出部分退回缓冲顺延。想拿走多少 carry 就得自掏
+        // 相应票款，资本门槛与捕获量线性挂钩；同时只要有人买票就会释放对应额度，
+        // 不会像阶跃门槛那样在低参与度下把钱永久冻结
+        (pot, tier1CarryIn) = _withholdExcessCarry(roundId, pot, tier1CarryIn);
 
         uint256 tierCount = s_tierBps.length;
         uint256 splitTotal = 0;
@@ -398,15 +419,22 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         carryOut += pot - splitTotal; // 比例切分的舍入余数
 
         r.state = RoundState.SETTLED;
+        r.settledAt = uint64(block.timestamp);
         if (carryOut > 0) {
             // 修复 A：入缓冲，由下一新期消费，不注入可能已封盘的当前期
             s_pendingTier1 += carryOut;
             emit PrizeRolledOver(roundId, s_currentRound + 1, carryOut);
         }
 
-        (uint32[] memory tickets, address[] memory winnersArr, uint8[] memory tiers) =
-            _deriveWinners(roundId);
-        emit WinnersPicked(roundId, tickets, winnersArr, tiers);
+        // FR-C-16：回调内只做记账。中奖人由 seed 完全决定，可离线/经 winnersOf 派生，
+        // 不在回调里做 16 次二分查找——那会让回调 gas 随 range 数增长，
+        // 高 slot 配置下可被灌票撑爆 1M 回调上限、使该期永久卡在 DRAWING（审计第四轮）
+        uint256 tierCountForEvent = s_tierBps.length;
+        uint256[] memory perWinnerAmounts = new uint256[](tierCountForEvent);
+        for (uint8 tier = 0; tier < tierCountForEvent; tier++) {
+            perWinnerAmounts[tier] = s_perWinnerAmount[roundId][tier];
+        }
+        emit DrawSettled(roundId, seed, r.ticketCount, perWinnerAmounts);
     }
 
     // ===== 领奖与资金 =====
@@ -416,7 +444,9 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         Round storage r = s_rounds[roundId];
         if (r.state != RoundState.SETTLED) revert RoundNotSettled();
         if (tier >= s_tierBps.length) revert InvalidTier();
-        if (block.timestamp > r.closeTime + CLAIM_WINDOW) revert ClaimWindowClosed();
+        // 窗口自结算时刻起算：keeper/VRF 停摆导致的结算延迟不得吃掉中奖者的领奖时间
+        // （审计第四轮：延迟 > 90 天时中奖者曾被判 0，奖金反被第三方 rollover 扫走）
+        if (block.timestamp > r.settledAt + CLAIM_WINDOW) revert ClaimWindowClosed();
         uint256 perWinner = s_perWinnerAmount[roundId][tier];
         if (perWinner == 0) revert TierNotOpened();
 
@@ -440,7 +470,8 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     function rolloverExpired(uint32 roundId) external {
         Round storage r = s_rounds[roundId];
         if (r.state != RoundState.SETTLED) revert RoundNotSettled();
-        if (block.timestamp <= r.closeTime + CLAIM_WINDOW) revert ClaimWindowNotClosed();
+        // 与 claim 同锚点：结算时刻 + 窗口，两者严格互斥无重叠
+        if (block.timestamp <= r.settledAt + CLAIM_WINDOW) revert ClaimWindowNotClosed();
         if (r.expiredRolled) revert AlreadyRolledOver();
         r.expiredRolled = true;
 
@@ -509,6 +540,16 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     /// @notice 本期 pot 中「非本期自售」的部分（滚存承接 + 注资），受参与度门槛保护
     function carriedPotOf(uint32 roundId) external view returns (uint256) {
         return s_rounds[roundId].carriedPot;
+    }
+
+    /// @notice 结算时刻与领奖截止时刻（窗口自结算起算，不受结算延迟影响）
+    function claimDeadlineOf(uint32 roundId)
+        external
+        view
+        returns (uint64 settledAt, uint64 claimDeadline)
+    {
+        settledAt = s_rounds[roundId].settledAt;
+        claimDeadline = settledAt == 0 ? 0 : settledAt + CLAIM_WINDOW;
     }
 
     // ===== 视图 =====
@@ -592,7 +633,7 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         Round storage r = s_rounds[roundId];
         uint256 tierCount = s_tierBps.length;
         amounts = new uint256[](tierCount);
-        if (r.state != RoundState.SETTLED || block.timestamp > r.closeTime + CLAIM_WINDOW) {
+        if (r.state != RoundState.SETTLED || block.timestamp > r.settledAt + CLAIM_WINDOW) {
             return amounts;
         }
         for (uint8 tier = 0; tier < tierCount; tier++) {
@@ -611,9 +652,29 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         return amounts;
     }
 
-    /// @notice 某期全部 Range 记录（测试界面用）
-    function getRanges(uint32 roundId) external view returns (TicketRange[] memory) {
-        return s_ranges[roundId];
+    /// @notice 某期的 Range 总条数（配合 getRanges 分页）
+    function rangeCountOf(uint32 roundId) external view returns (uint256) {
+        return s_ranges[roundId].length;
+    }
+
+    /// @notice 分页读取某期的 Range 记录。
+    /// @dev 必须分页：返回结构体数组的内存扩展成本是 O(N²)，一次性返回上万条会
+    ///      超出节点的 eth_call gas 上限而直接报错——攻击者用大量单张购买灌 range
+    ///      即可让前端视图对所有人失效（审计第四轮）。offset/limit 让调用方自控代价
+    function getRanges(uint32 roundId, uint256 offset, uint256 limit)
+        external
+        view
+        returns (TicketRange[] memory page)
+    {
+        TicketRange[] storage all = s_ranges[roundId];
+        uint256 total = all.length;
+        if (offset >= total) return new TicketRange[](0);
+        uint256 end = offset + limit;
+        if (end > total) end = total;
+        page = new TicketRange[](end - offset);
+        for (uint256 i = offset; i < end; i++) {
+            page[i - offset] = all[i];
+        }
     }
 
     /// @notice 某地址在某期持有的票数（测试界面用；正式前端走事件）
@@ -628,9 +689,41 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
 
     // ===== 内部 =====
 
+    /// @dev 按自售额配比扣留超额 carry（FR-C-27）：本期可分配的滚存/注资上限 =
+    ///      自售净额 × CARRY_MATCH_MULTIPLIER，超出部分退回缓冲顺延。
+    ///      返回扣留后可供分账的 pot 与一等奖 carry
+    function _withholdExcessCarry(uint32 roundId, uint256 pot, uint256 tier1CarryIn)
+        private
+        returns (uint256, uint256)
+    {
+        Round storage r = s_rounds[roundId];
+        uint256 budget = (r.pot - r.carriedPot) * CARRY_MATCH_MULTIPLIER; // carriedPot <= pot 恒成立
+        uint256 withheldPot = r.carriedPot > budget ? r.carriedPot - budget : 0;
+        budget = r.carriedPot > budget ? 0 : budget - r.carriedPot;
+        uint256 withheldTier1 = tier1CarryIn > budget ? tier1CarryIn - budget : 0;
+
+        if (withheldPot > 0) {
+            s_pendingPot += withheldPot;
+            pot -= withheldPot;
+            r.pot -= withheldPot; // 同步账面，避免 getRound 仍报告已被扣留的钱
+            r.carriedPot -= withheldPot;
+        }
+        if (withheldTier1 > 0) {
+            s_pendingTier1 += withheldTier1;
+            tier1CarryIn -= withheldTier1;
+            r.tier1Carry -= withheldTier1;
+        }
+        if (withheldPot + withheldTier1 > 0) {
+            emit CarryWithheld(roundId, withheldPot + withheldTier1);
+            emit PrizeRolledOver(roundId, s_currentRound + 1, withheldPot + withheldTier1);
+        }
+        return (pot, tier1CarryIn);
+    }
+
     /// @dev 开启下一期：closeTime 取日程中晚于当前时刻的最近场次（跳过已错过的场次，Q2）
     function _openNextRound(uint256 carryPot, uint256 carryTier1) private returns (uint32 newId) {
-        uint64 t = s_lastSlotTime;
+        uint64 prevSlot = s_lastSlotTime;
+        uint64 t = prevSlot;
         uint32 cursor = s_intervalCursor;
         uint32 len = uint32(s_intervals.length);
         // 跳过距今不足 MIN_SALES_WINDOW 的场次：performUpkeep 任何人可择时调用，
@@ -649,13 +742,27 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         // 暂停状态快照（审计第三轮 #1）：本期能否购票在开期时一次性定死。
         // 否则 owner 可全程暂停清场、末秒解禁自购，独占整包奖池
         r.salesPausedAtOpen = s_salesPaused;
-        // 消费滚存缓冲区：过期滚存与未开出奖级 carry 在此并入新期。
-        // 开期时 pot 全部来自 carry（本期尚无自售），据此建立参与度门槛的基线
-        r.pot = carryPot + s_pendingPot;
+        r.feeBpsAtOpen = s_feeBps; // 费率同样开期定死，防止对已开出期的购票抢跑抬价
+
+        // 及时性闸：只有当本期拿到「足够完整」的售票窗口时才释放缓冲。
+        // 名义窗口 = 上期开奖时刻 → 本期停售；实际窗口 = 现在 → 本期停售。
+        // keeper 及时则两者接近；攻击者拖到临近场次才开期则实际窗口远小于名义，
+        // 此时缓冲留待下一个由及时 keeper 开出的期，杜绝「自选短窗口再独占」
+        uint64 prevDraw = prevSlot + SEAL_GAP;
+        uint256 nominal = t > prevDraw ? t - prevDraw : 0;
+        uint256 actual = t > block.timestamp ? t - block.timestamp : 0;
+        bool timely = nominal == 0 || actual * 100 >= nominal * CARRY_WINDOW_COMPLETENESS_PCT;
+
+        r.pot = carryPot;
+        r.tier1Carry = carryTier1;
+        if (timely) {
+            r.pot += s_pendingPot;
+            r.tier1Carry += s_pendingTier1;
+            s_pendingPot = 0;
+            s_pendingTier1 = 0;
+        }
+        // 开期时 pot 全部来自 carry（本期尚无自售），据此建立配比释放的基线
         r.carriedPot = r.pot;
-        r.tier1Carry = carryTier1 + s_pendingTier1;
-        s_pendingPot = 0;
-        s_pendingTier1 = 0;
         emit RoundOpened(newId, t);
     }
 

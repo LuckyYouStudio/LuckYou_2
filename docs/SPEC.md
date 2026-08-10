@@ -143,23 +143,44 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
 - **FR-C-17** **MUST** 采用 pull 模式：中奖者调用 `claim(roundId, tier)` 领取
 - **FR-C-18** `claim` **MUST** 遵循 Checks-Effects-Interactions，且 **MUST** 加
   `ReentrancyGuard`
-- **FR-C-19** 领奖窗口 `CLAIM_WINDOW` = 90 天（自该期 `closeTime` 起算）。
-  超期后 `rolloverExpired(roundId)` **MUST** 允许任何人把未领奖金滚存进当前期奖池
+- **FR-C-19** 领奖窗口 `CLAIM_WINDOW` = 90 天，**自该期实际结算时刻 `settledAt` 起算**
+  （2026-08-10 第四轮自查：原按 `closeTime` 起算，keeper/VRF 停摆超 90 天时中奖者
+  会被判 0 且奖金被第三方扫走）。超期后 `rolloverExpired(roundId)` **MUST** 允许任何人
+  把未领奖金**转入滚存缓冲区**（见 FR-C-28），**MUST NOT** 直接注入当前期——
+  当前期可能已封盘、票已冻结，攻击者可预先卡位独占（第二轮 High A）
+  - 验收：停摆 91 天后结算，中奖者仍可领奖；第三方在此之前无法 rollover
 - **FR-C-20** 运营抽成 **MUST** 与奖池分账记录（独立的 `accruedFees` 变量）
   - 验收：提走全部 fees 后，各期 pot 之和不变，合约余额仍 ≥ 所有未领奖金
 - **FR-C-21** 抽成比例上限 `MAX_FEE_BPS` **MUST** 是 `constant`（1000 = 10%），
   owner 也无法突破。部署默认 `feeBps` **MUST** 为 100（1%）（2026-08-07 定）
-- **FR-C-27** 滚存/注资的参与度门槛（2026-08-10 第三轮自查增）：本期票数低于
-  `MIN_TICKETS_FOR_CARRY`（100，`constant`）时，pot 中「非本期自售」的部分
-  （滚存承接 + 注资，即 `carriedPot`）与 `tier1Carry` **MUST NOT** 予以分配，
-  而是原样退回缓冲区顺延到后续期；只分配本期自售所得。
-  - 理由：抬高「用最少的票吃掉整包滚存」的资本门槛
-  - **诚实的局限**：这不能在理论上消除捕获——攻击者买满门槛票数仍可独占，
-    只是所需资本从「几张票」升到「门槛票数」，且自己投入的钱会回到自己手里，
-    净收益仍为滚存额减手续费。**买光全场即可拿走全部奖池，是抽签制彩票的固有性质**，
-    真正的稀释只能来自其他人的实际参与。门槛是缓解，不是根治
-  - 验收：注资 200、仅买 8 张时该 200 退回缓冲，买家只赢到自售奖池且净亏手续费；
-    买满 100 张时滚存正常分配
+- **FR-C-28** 滚存缓冲区（2026-08-10 第二/四轮自查增）：`s_pendingPot` 与
+  `s_pendingTier1` **MUST** 作为滚存资金的中转站。入口三处：过期滚存（FR-C-19）、
+  未开出奖级的 carry（Q1）、超出配比被扣留的部分（FR-C-27）；出口唯一：
+  `_openNextRound` 在开出新期时消费。
+  - **释放的两个前置条件**（缺一不可）：
+    1. **窗口完整度**：新期实际售票窗口 **MUST** 达到名义窗口的
+       `CARRY_WINDOW_COMPLETENESS_PCT`（80%）。`performUpkeep` 无权限、开期时刻由
+       调用者选，若不设此闸，攻击者可拖到临近场次才开期、在同一笔交易内买光独占
+    2. **配比**（FR-C-27）
+  - 缓冲区余额 **MUST** 计入偿付性不变量（FR-T-03）
+  - 因 FR-C-10「开奖即开下一期」，某期结算产生的 carry 实际落在**再下一个新开出的期**，
+    而非紧邻的下一期
+  - 验收：`test/LotteryCarryTiming.t.sol`、`test/LotteryCarryEscape.t.sol`
+
+- **FR-C-27** 滚存/注资的释放配比（2026-08-10 第三轮增、第四轮重做）：
+  本期可分配的 carry 上限 **MUST** = 本期自售净额 × `CARRY_MATCH_MULTIPLIER`（1），
+  超出部分退回缓冲区顺延（FR-C-28）。
+  - **演进过程**（两个被 PoC 打穿的方案，记录以免重蹈）：
+    ① 阶跃门槛「票数达 100 就全放」——恰好买满门槛即可独占整包，捕获成本与 carry
+    规模无关（O(1)），carry 越大越划算；
+    ② 加「连续扣留 3 期后强制放行」逃生阀——攻击者用 1 张票攒计数器，
+    成本降到 8 USDC 吃掉 10000 USDC（**第四轮 Critical**）
+  - 现行配比制使资本门槛与捕获量线性挂钩，且只要有人买票就释放对应额度，
+    不会像阶跃门槛那样在低参与度下把资金永久冻结
+  - **诚实的局限**：仍不能消除捕获。买光全场即可拿走全部奖池是抽签制彩票的
+    固有性质，攻击者的本金也会随中奖回到自己手里；配比只抬高资本门槛
+    （投 X 至多撬动 X 的 carry）并给其他参与者稀释的机会
+  - 验收：注资 10000、仅买 8 张时至多拿回「本金 + 等额 carry」，其余留在缓冲
 
 - **FR-C-26** 冷启动注资（2026-08-07 增）：**MUST** 提供
   `injectPot(uint32 roundId, uint256 amount)`，任何人可向处于 OPEN 状态的期
@@ -202,7 +223,7 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   TicketsBought(uint32 indexed roundId, address indexed buyer, uint32 start, uint32 quantity)
   PotInjected(uint32 indexed roundId, address indexed sender, uint256 amount)
   DrawRequested(uint32 indexed roundId, uint256 indexed requestId)
-  WinnersPicked(uint32 indexed roundId, uint32[] winningTickets, address[] winners, uint8[] tiers)
+  DrawSettled(uint32 indexed roundId, uint256 seed, uint32 ticketCount, uint256[] perWinnerAmounts)
   PrizeClaimed(uint32 indexed roundId, address indexed winner, uint8 tier, uint256 amount)
   PrizeRolledOver(uint32 indexed fromRound, uint32 indexed toRound, uint256 amount)
   RoundVoided(uint32 indexed roundId)

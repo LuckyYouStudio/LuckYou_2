@@ -112,6 +112,34 @@ contract LotteryHandler is Test {
             totalFeesWithdrawn += token.balanceOf(treasury) - before;
         } catch {}
     }
+
+    /// @dev 覆盖暂停快照路径（审计第三轮 #1）：owner 任意时刻切换，
+    ///      不变量必须在「有期被禁售、有期正常」的混合状态下依然成立
+    function togglePause(bool paused) external {
+        vm.prank(lottery.owner());
+        try lottery.setSalesPaused(paused) {} catch {}
+    }
+
+    /// @dev 覆盖 VRF 重试路径（审计第二轮 B）：超时后追加请求，
+    ///      两个 requestId 同时挂起时先到先得，不得造成重复结算或资金错乱
+    function retryDraw(uint256 roundSeed) external {
+        uint32 cur = lottery.s_currentRound();
+        uint32 roundId = uint32(bound(roundSeed, 1, cur));
+        try lottery.retryDraw(roundId) {} catch {}
+    }
+
+    /// @dev 覆盖「旧请求迟到回调」：对任意期用任意 requestId 尝试回调，
+    ///      验证 state 闸在乱序下的稳健性
+    function lateFulfill(uint256 roundSeed, uint256 seed) external {
+        uint32 cur = lottery.s_currentRound();
+        uint32 roundId = uint32(bound(roundSeed, 1, cur));
+        (uint256 requestId,) = lottery.vrfRequestOf(roundId);
+        if (requestId == 0) return;
+        uint256[] memory words = new uint256[](1);
+        words[0] = seed;
+        try coordinator.fulfillRandomWordsWithOverride(requestId, address(lottery), words) {}
+            catch {}
+    }
 }
 
 contract LotteryInvariantTest is Test {

@@ -75,6 +75,32 @@
   },
   {
     "type": "function",
+    "name": "CARRY_MATCH_MULTIPLIER",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "CARRY_WINDOW_COMPLETENESS_PCT",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "CLAIM_WINDOW",
     "inputs": [],
     "outputs": [
@@ -134,19 +160,6 @@
         "name": "",
         "type": "uint64",
         "internalType": "uint64"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "MIN_TICKETS_FOR_CARRY",
-    "inputs": [],
-    "outputs": [
-      {
-        "name": "",
-        "type": "uint32",
-        "internalType": "uint32"
       }
     ],
     "stateMutability": "view"
@@ -247,7 +260,7 @@
   },
   {
     "type": "function",
-    "name": "getRanges",
+    "name": "claimDeadlineOf",
     "inputs": [
       {
         "name": "roundId",
@@ -257,7 +270,41 @@
     ],
     "outputs": [
       {
-        "name": "",
+        "name": "settledAt",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "claimDeadline",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getRanges",
+    "inputs": [
+      {
+        "name": "roundId",
+        "type": "uint32",
+        "internalType": "uint32"
+      },
+      {
+        "name": "offset",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "limit",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "page",
         "type": "tuple[]",
         "internalType": "struct Lottery.TicketRange[]",
         "components": [
@@ -525,6 +572,25 @@
     ],
     "outputs": [],
     "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "rangeCountOf",
+    "inputs": [
+      {
+        "name": "roundId",
+        "type": "uint32",
+        "internalType": "uint32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
   },
   {
     "type": "function",
@@ -844,6 +910,25 @@
   },
   {
     "type": "event",
+    "name": "CarryWithheld",
+    "inputs": [
+      {
+        "name": "roundId",
+        "type": "uint32",
+        "indexed": true,
+        "internalType": "uint32"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "CoordinatorSet",
     "inputs": [
       {
@@ -870,6 +955,37 @@
         "type": "uint256",
         "indexed": true,
         "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "DrawSettled",
+    "inputs": [
+      {
+        "name": "roundId",
+        "type": "uint32",
+        "indexed": true,
+        "internalType": "uint32"
+      },
+      {
+        "name": "seed",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "ticketCount",
+        "type": "uint32",
+        "indexed": false,
+        "internalType": "uint32"
+      },
+      {
+        "name": "perWinnerAmounts",
+        "type": "uint256[]",
+        "indexed": false,
+        "internalType": "uint256[]"
       }
     ],
     "anonymous": false
@@ -1110,37 +1226,6 @@
         "type": "address",
         "indexed": true,
         "internalType": "address"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "WinnersPicked",
-    "inputs": [
-      {
-        "name": "roundId",
-        "type": "uint32",
-        "indexed": true,
-        "internalType": "uint32"
-      },
-      {
-        "name": "winningTickets",
-        "type": "uint32[]",
-        "indexed": false,
-        "internalType": "uint32[]"
-      },
-      {
-        "name": "winners",
-        "type": "address[]",
-        "indexed": false,
-        "internalType": "address[]"
-      },
-      {
-        "name": "tiers",
-        "type": "uint8[]",
-        "indexed": false,
-        "internalType": "uint8[]"
       }
     ],
     "anonymous": false

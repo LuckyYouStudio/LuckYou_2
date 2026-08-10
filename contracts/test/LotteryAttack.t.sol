@@ -333,7 +333,7 @@ contract LotteryEdgeTest is LotteryTestBase {
         lottery.retryDraw(1); // 不 revert
         _fulfill(1, 42);
 
-        vm.warp(_closeTimeOf(1) + 90 days + 1);
+        vm.warp(_settledAtOf(1) + 90 days + 1);
         lottery.rolloverExpired(1); // 不 revert
     }
 }

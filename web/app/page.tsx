@@ -81,6 +81,8 @@ export default function Home() {
   const [treasuryBal, setTreasuryBal] = useState<bigint>(0n);
   const [paused, setPaused] = useState(false);
   const [ticketPrice, setTicketPrice] = useState<bigint>(0n);
+  const [feeBps, setFeeBps] = useState<number>(0);
+  const [treasuryAddr, setTreasuryAddr] = useState<Address | null>(null);
   const [winners, setWinners] = useState<Map<number, { tickets: number[]; owners: Address[]; tiers: number[] }>>(
     new Map(),
   );
@@ -171,7 +173,7 @@ export default function Home() {
           address: addresses.lottery,
           abi: lotteryAbi,
           functionName: "getRanges",
-          args: [cur],
+          args: [cur, 0, 200], // 分页：一次性拉全部在 range 数多时会超出节点 eth_call 上限
         })) as readonly { start: number; end: number; owner: Address }[];
         setMyRanges(
           curRanges
@@ -224,12 +226,25 @@ export default function Home() {
           functionName: "s_accruedFees",
         })) as bigint,
       );
+      const liveTreasury = (await publicClient.readContract({
+        address: addresses.lottery,
+        abi: lotteryAbi,
+        functionName: "s_treasury",
+      })) as Address;
+      setTreasuryAddr(liveTreasury);
+      setFeeBps(
+        (await publicClient.readContract({
+          address: addresses.lottery,
+          abi: lotteryAbi,
+          functionName: "s_feeBps",
+        })) as number,
+      );
       setTreasuryBal(
         (await publicClient.readContract({
           address: addresses.usdc,
           abi: erc20Abi,
           functionName: "balanceOf",
-          args: [addresses.treasury],
+          args: [liveTreasury],
         })) as bigint,
       );
       setPaused(
@@ -309,13 +324,13 @@ export default function Home() {
       </h1>
       <p className="subtitle">
         {chain.name} (chainId {expectedChainId}) · Lottery <span className="addr">{addresses.lottery}</span> · 票价{" "}
-        {ticketPrice > 0n ? fmt6(ticketPrice) : "…"} · 抽成 1% ·{" "}
+        {ticketPrice > 0n ? fmt6(ticketPrice) : "…"} · 抽成 {(feeBps / 100).toFixed(2)}% ·{" "}
         <a href="/history" style={{ color: "var(--blue)" }}>
           我的记录 →
         </a>
       </p>
 
-      {wrongChain && <div className="banner" style={{ borderColor: "var(--red)" }}>⚠ RPC 链 ID 不是 31337，请确认 anvil 已启动</div>}
+      {wrongChain && <div className="banner" style={{ borderColor: "var(--red)" }}>{`⚠ 链 ID 不匹配：期望 ${expectedChainId}（${chain.name}），请切换网络`}</div>}
 
       {totalPending > 0n && (
         <div className="banner">🎉 你有 {fmt6(totalPending)} 奖金未领取！在下方「我的奖金」中一键领取。</div>
@@ -329,8 +344,13 @@ export default function Home() {
               <div className="row">
                 <span className="k">状态</span>
                 <span className={`tag ${STATE_TAGS[current.state]}`}>
-                  {STATE_NAMES[current.state]}
-                  {current.state === 1 && chainNow >= current.closeTime ? "（已封盘）" : ""}
+                  {current.state === 1 && chainNow >= current.drawTime
+                    ? "开奖中"
+                    : STATE_NAMES[current.state]}
+                  {current.state === 1 && chainNow >= current.closeTime && chainNow < current.drawTime
+                    ? "（已封盘）"
+                    : ""}
+                  {current.state === 1 && chainNow >= current.drawTime ? "（等待 keeper 触发）" : ""}
                 </span>
               </div>
               <div className="row">
@@ -597,6 +617,10 @@ export default function Home() {
           <div className="row">
             <span className="k">累计抽成</span>
             <span className="v">{fmt6(fees)}</span>
+          </div>
+          <div className="row">
+            <span className="k">treasury</span>
+            <span className="v addr">{treasuryAddr ? short(treasuryAddr) : "…"}</span>
           </div>
           <div className="row">
             <span className="k">treasury 余额</span>
