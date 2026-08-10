@@ -566,6 +566,32 @@
   },
   {
     "type": "function",
+    "name": "s_pendingPot",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "s_pendingTier1",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "s_salesPaused",
     "inputs": [],
     "outputs": [
@@ -736,6 +762,11 @@
         "name": "winners",
         "type": "address[]",
         "internalType": "address[]"
+      },
+      {
+        "name": "tiers",
+        "type": "uint8[]",
+        "internalType": "uint8[]"
       }
     ],
     "stateMutability": "view"
@@ -1040,6 +1071,12 @@
         "type": "address[]",
         "indexed": false,
         "internalType": "address[]"
+      },
+      {
+        "name": "tiers",
+        "type": "uint8[]",
+        "indexed": false,
+        "internalType": "uint8[]"
       }
     ],
     "anonymous": false

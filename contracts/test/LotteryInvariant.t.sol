@@ -182,7 +182,9 @@ contract LotteryInvariantTest is Test {
 
     /// @dev FR-T-03 不变量一：合约余额 >= 所有未领奖金 + accruedFees（此处收紧为恒等式）
     function invariant_SolvencyExact() public view {
-        uint256 obligations = lottery.s_accruedFees();
+        // 滚存缓冲区（修复 A）也是待并入下一新期的应付义务
+        uint256 obligations =
+            lottery.s_accruedFees() + lottery.s_pendingPot() + lottery.s_pendingTier1();
         uint32 cur = lottery.s_currentRound();
         for (uint32 id = 1; id <= cur; id++) {
             (Lottery.RoundState st,,,, uint256 pot, uint256 carry,,,) = lottery.getRound(id);

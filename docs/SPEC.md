@@ -165,7 +165,12 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   `claim` / `rolloverExpired` / `retryDraw` **MUST** 不受影响
   - 验收：暂停状态下中奖者仍能成功领奖
 - **FR-C-24** **MUST NOT** 存在任何形式的 `emergencyWithdraw` / `sweep` /
-  `rescueTokens`，能动到未领奖金
+  `rescueTokens`，能动到未领奖金。
+  - **外部信任方披露（2026-08-10 安全自查 C）**：合约依赖的 Chainlink VRF 订阅
+    由订阅所有者掌控。订阅所有者 `removeConsumer` 或撤走 LINK 会使 `performUpkeep`
+    与 `retryDraw` 的 VRF 请求失败，已进 DRAWING 的期将无法结算、其奖池被冻结，
+    且合约**刻意不提供**任何行政解冻手段（否则即违反本条）。这是使用 VRF 订阅模式的
+    固有信任假设，非合约缺陷；主网运营须由可信主体（多签）持有订阅并维持 LINK 余额
 
 ### 4.7 事件
 
@@ -175,7 +180,7 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   TicketsBought(uint32 indexed roundId, address indexed buyer, uint32 start, uint32 quantity)
   PotInjected(uint32 indexed roundId, address indexed sender, uint256 amount)
   DrawRequested(uint32 indexed roundId, uint256 indexed requestId)
-  WinnersPicked(uint32 indexed roundId, uint32[] winningTickets, address[] winners)
+  WinnersPicked(uint32 indexed roundId, uint32[] winningTickets, address[] winners, uint8[] tiers)
   PrizeClaimed(uint32 indexed roundId, address indexed winner, uint8 tier, uint256 amount)
   PrizeRolledOver(uint32 indexed fromRound, uint32 indexed toRound, uint256 amount)
   RoundVoided(uint32 indexed roundId)

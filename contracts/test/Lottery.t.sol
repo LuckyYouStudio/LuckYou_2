@@ -398,27 +398,30 @@ contract LotteryDrawTest is LotteryTestBase {
     }
 
     /// @dev FR-C-15 验收：新请求先落地后，旧请求迟到返回不得改写结果
+    /// @dev FR-C-15：已结算结果不可被迟到回调改写。
+    ///      注意——修复 B 后 DRAWING 期是「先到先得」，不再作废旧请求的回调；
+    ///      FR-C-15 的保障由 state 闸提供：一旦 SETTLED，任何迟到回调都被拦下。
+    ///      「retryDraw 后旧回调仍可先落定」的先到先得回归见 LotteryRerollGuard.t.sol
     function test_StaleVrfCallback_CannotOverrideResult() public {
         _buy(alice, 10);
         _triggerDraw(1);
-        (uint256 oldRequest,) = lottery.vrfRequestOf(1);
+        (uint256 firstRequest,) = lottery.vrfRequestOf(1);
 
         vm.warp(block.timestamp + 3 hours);
         lottery.retryDraw(1);
+        (uint256 secondRequest,) = lottery.vrfRequestOf(1);
 
-        // 旧请求先到：静默忽略
+        // 第二个请求先落地结算
         uint256[] memory words = new uint256[](1);
-        words[0] = 111;
-        coordinator.fulfillRandomWordsWithOverride(oldRequest, address(lottery), words);
-        assertEq(uint8(_stateOf(1)), uint8(Lottery.RoundState.DRAWING));
-        (,,,,,, uint256 seed,,) = lottery.getRound(1);
-        assertEq(seed, 0);
-
-        // 新请求落地：正常结算
-        _fulfill(1, 222);
+        words[0] = 222;
+        coordinator.fulfillRandomWordsWithOverride(secondRequest, address(lottery), words);
         assertEq(uint8(_stateOf(1)), uint8(Lottery.RoundState.SETTLED));
-        (,,,,,, seed,,) = lottery.getRound(1);
-        assertEq(seed, 222);
+
+        // 第一个请求的回调迟到：被 state 闸拦下，结果不变
+        words[0] = 111;
+        coordinator.fulfillRandomWordsWithOverride(firstRequest, address(lottery), words);
+        (,,,,,, uint256 seed,,) = lottery.getRound(1);
+        assertEq(seed, 222, "settled result is immutable");
     }
 }
 
@@ -441,7 +444,7 @@ contract LotterySettleClaimTest is LotteryTestBase {
 
     function test_Winners_AreAlwaysRealTicketHolders() public {
         _setupSettledRound100();
-        (uint32[] memory tickets, address[] memory winners) = lottery.winnersOf(1);
+        (uint32[] memory tickets, address[] memory winners,) = lottery.winnersOf(1);
         assertEq(tickets.length, 8);
         for (uint256 i = 0; i < tickets.length; i++) {
             assertLt(tickets[i], 100);
@@ -451,7 +454,7 @@ contract LotterySettleClaimTest is LotteryTestBase {
 
     function test_Claim_FullLifecycle() public {
         _setupSettledRound100();
-        (, address[] memory winners) = lottery.winnersOf(1);
+        (, address[] memory winners,) = lottery.winnersOf(1);
         address tier0Winner = winners[0];
 
         uint256 before = token.balanceOf(tier0Winner);
@@ -467,7 +470,7 @@ contract LotterySettleClaimTest is LotteryTestBase {
 
     function test_Claim_MultipleSlotsSameTierPaidTogether() public {
         _setupSettledRound100();
-        (, address[] memory winners) = lottery.winnersOf(1);
+        (, address[] memory winners,) = lottery.winnersOf(1);
         // tier2 的 5 个 slot（索引 3..7），按人归并领取
         for (uint256 i = 3; i < 8; i++) {
             address w = winners[i];
@@ -496,31 +499,31 @@ contract LotterySettleClaimTest is LotteryTestBase {
     function test_Claim_WorksWhileSalesPaused() public {
         _setupSettledRound100();
         lottery.setSalesPaused(true);
-        (, address[] memory winners) = lottery.winnersOf(1);
+        (, address[] memory winners,) = lottery.winnersOf(1);
         vm.prank(winners[0]);
         lottery.claim(1, 0); // 不 revert 即通过
     }
 
     function test_RevertWhen_ClaimAfterWindow() public {
         _setupSettledRound100();
-        (, address[] memory winners) = lottery.winnersOf(1);
+        (, address[] memory winners,) = lottery.winnersOf(1);
         vm.warp(_closeTimeOf(1) + 90 days + 1);
         vm.prank(winners[0]);
         vm.expectRevert(Lottery.ClaimWindowClosed.selector);
         lottery.claim(1, 0);
     }
 
-    /// @dev FR-C-19：过期未领奖金滚入当前期奖池，任何人可触发
-    function test_RolloverExpired_MovesUnclaimedToCurrentPot() public {
+    /// @dev FR-C-19：过期未领奖金滚存，任何人可触发。
+    ///      修复 A 后钱先入 s_pendingPot 缓冲区（不注入可能已封盘的当前期），
+    ///      由下一新期消费。滚存进封盘期的攻击回归见 LotteryCarryTiming.t.sol
+    function test_RolloverExpired_BuffersUnclaimed() public {
         _setupSettledRound100();
         vm.warp(_closeTimeOf(1) + 90 days + 1);
 
-        uint32 current = lottery.s_currentRound();
-        uint256 potBefore = _potOf(current);
         vm.prank(makeAddr("anyone"));
         lottery.rolloverExpired(1);
-        // 无人领奖：99e6 全额滚存
-        assertEq(_potOf(current) - potBefore, 99e6);
+        // 无人领奖：99e6 全额入缓冲
+        assertEq(lottery.s_pendingPot(), 99e6);
 
         vm.expectRevert(Lottery.AlreadyRolledOver.selector);
         lottery.rolloverExpired(1);
@@ -533,7 +536,7 @@ contract LotterySettleClaimTest is LotteryTestBase {
     }
 
     /// @dev Q1 验收：3 张票时三等奖（5 名）不开出，其 15% 滚入下期一等奖份额
-    function test_Q1_SmallRound_UnopenedTierRollsToNextTier1Carry() public {
+    function test_Q1_SmallRound_UnopenedTierBuffered() public {
         _buy(alice, 3);
         _settleRound(1, 7);
 
@@ -543,23 +546,31 @@ contract LotterySettleClaimTest is LotteryTestBase {
             lottery.perWinnerAmount(1, 1), 371_250, unicode"tier1 照常开出（2 名 <= 3）"
         );
         assertEq(lottery.perWinnerAmount(1, 2), 0, unicode"tier2 不开出（5 名 > 3）");
-        assertEq(_carryOf(2), 445_500, unicode"15% 滚入下期一等奖份额");
+        // 修复 A：carry 先入缓冲区，不直接注入当前期
+        assertEq(lottery.s_pendingTier1(), 445_500, unicode"15% carry 入缓冲");
 
         vm.prank(alice);
         vm.expectRevert(Lottery.TierNotOpened.selector);
         lottery.claim(1, 2);
     }
 
-    /// @dev Q1 后续：下期一等奖份额 = 下期 pot 的 60% + 上期滚存
-    function test_Q1_CarryPaidIntoNextTier1() public {
+    /// @dev Q1 后续：缓冲的 carry 并入之后开出的新期一等奖份额。
+    ///      因 FR-C-10「开奖即开下一期」，下一期在本期结算前已开出，故 carry 落在再下一新期
+    function test_Q1_CarryPaidIntoLaterTier1() public {
         _buy(alice, 3);
-        _settleRound(1, 7);
-        assertEq(_carryOf(2), 445_500);
+        _settleRound(1, 7); // carry 445500 入缓冲
+        assertEq(lottery.s_pendingTier1(), 445_500);
 
+        // round2（结算 round1 前已开出）未拿到 carry
         _buy(bob, 100);
-        _settleRound(2, 8);
-        // round2 pot = 99e6：tier0 = 59.4e6 + 445500
-        assertEq(lottery.perWinnerAmount(2, 0), 594e5 + 445_500);
+        _settleRound(2, 8); // 开出 round3 时消费缓冲
+        assertEq(lottery.s_pendingTier1(), 0, "buffer consumed");
+        assertEq(lottery.perWinnerAmount(2, 0), 594e5, "round2 jackpot = its own pot only");
+
+        // carry 落入 round3 的一等奖份额
+        _buy(carol, 100);
+        _settleRound(3, 9);
+        assertEq(lottery.perWinnerAmount(3, 0), 594e5 + 445_500, "round3 jackpot includes carry");
     }
 
     function test_WithdrawFees_DoesNotTouchPots() public {

@@ -159,3 +159,77 @@ VRF 可靠时几乎不发生，且任何人可救，但属真实的活性缺口�
 - **已部署的测试网实例 `0x928C…75Aa` 是修复前的版本**，含 Critical 漏洞。
   测试网无真实资金，但演示前建议重新部署修复版
 - 主网前仍需：第三方独立审计 → 合规（牌照/运营主体）
+
+---
+
+# 第二轮：深度对抗复查（2026-08-10）
+
+第一轮修复后又做了一轮更深的对抗复查，发现 1 个 High、2 个 Medium 及若干 Low。
+**A 与 B 均已用 PoC 坐实、修复、并有回归测试。**
+
+| # | 严重度 | 问题 | 状态 |
+|---|---|---|---|
+| A | **High** | rolloverExpired 绕过封盘时间闸，过期奖金可被封盘期唯一买家确定性独占 | ✅ 已修复 + PoC 回归 |
+| B | **Medium** | retryDraw 覆写 vrfRequestId，使即将落地的回调可被作废 = 重摇 | ✅ 已修复 + 回归 |
+| C | Medium | VRF 订阅所有者是未披露的信任方，可冻结 DRAWING 期奖池 | ✅ 已在 SPEC FR-C-24 披露 |
+| D | Low | WinnersPicked 事件缺 tier 映射，非单调配置下前端错标奖级 | ✅ 事件+winnersOf 增补 tiers |
+| E | Low | 前端硬编码 1e6 票价与 6 位精度，与 FR-C-01 相悖 | ✅ 改为从链上读 decimals/price |
+| F | Low | getRanges/ticketsOwned 无界循环被前端 10s 轮询 | 📋 view 函数，已知（见下） |
+| G | Low | 整体覆盖率含 vendored 模板偏低 | ✅ 覆盖率按 Lottery.sol 计，见下 |
+| H | Low | 构造器允许配出 1 分钟售票窗口 | 📋 部署方须知，已知 |
+| I | Low | broadcast/ 声明忽略但实际在库 | ✅ 保留（forge 部署存档惯例） |
+
+## A（High）— rolloverExpired 绕过封盘闸【已修复】
+
+第一轮修复 #5 给 injectPot 加了 `block.timestamp < closeTime` 时间闸，但只堵了一个入口。
+`rolloverExpired`（任何人可调、时机自由）与 `fulfillRandomWords` 的 carry 仍直接注入
+`s_currentRound`，而封盘期（closeTime→drawTime，75 分钟）里当前期仍是 OPEN、票已冻结。
+
+**攻击（PoC 实测）**：攻击者每期买 8 张（覆盖全部中奖 slot），到 closeTime 时票已定死、
+链上可查自己是否唯一买家。是就调 rolloverExpired 把整包过期奖金砸进本期 → 必中全奖级 →
+确定性独占。bob 花 8 USDC 赢回 17.82 USDC，净赚 9.82。这把第一轮 #2 的「概率性经济风险」
+升级成了「确定性攻击」。
+
+**修复**：引入 `s_pendingPot` / `s_pendingTier1` 缓冲区。rolloverExpired 与 fulfillRandomWords
+的 carry 不再注入当前期，而是入缓冲，由 `_openNextRound` 在开出**拥有完整未封盘售票窗口**的
+新期时消费。钱只能进无人能预先卡位为唯一买家的期。语义微调：因 FR-C-10「开奖即开下一期」，
+carry 落在结算期之后开出的新期（而非紧邻的下一期），滚存意图不变。不变量测试已纳入两个缓冲区。
+回归：`test/LotteryCarryTiming.t.sol`。
+
+## B（Medium）— retryDraw 让结果变成可选择【已修复】
+
+`fulfillRandomWords` 原以 `r.vrfRequestId != requestId` 为闸。retryDraw 覆写 vrfRequestId 后，
+上一次请求的回调即使在 DRAWING 期到达也被作废。后果：某期 DRAWING 超 3 小时后，任何人拿到
+一个「重摇期权」——看到即将落地、对己不利的回调，抢先 retryDraw 作废它。随机数没被预测，
+但「接受哪一次随机数」变成可选，等价于操纵，抵触 FR-C-11。（Base 私有内存池使抢跑困难，
+但那是链的护城河、不是合约的安全属性。）
+
+**修复**：改为先到先得——DRAWING 期内任何已登记请求的回调先落定；一旦 SETTLED，state 闸拦下
+所有迟到回调（FR-C-15 仍满足）。retryDraw 仍可在 VRF 真卡死时追加请求，但无法作废一个
+即将落地的结果。回归：`test/LotteryRerollGuard.t.sol`。
+
+## C~I 说明
+
+- **C（已披露）**：见 SPEC FR-C-24 的「外部信任方披露」。无代码修复——任何解冻手段都会违反
+  FR-C-24 的无后门原则。运营须由多签持有订阅并维持 LINK。
+- **D（已修复）**：`_deriveWinners`、`winnersOf`、`WinnersPicked` 事件均增补 `uint8[] tiers`，
+  前端直接用合约返回的奖级，不再靠 slot 顺序推断（非单调 winnerCounts 配置下会错标）。
+  FR-C-25「仅靠事件重建历史」现真正成立。
+- **E（已修复）**：前端改为从链上读 `decimals()` / `symbol()` / `i_ticketPrice()`，
+  金额格式化与 approve/inject 额度不再硬编码。
+- **F（已知）**：`getRanges` / `ticketsOwned` 是 view 函数，前端 10s 轮询不消耗用户 gas；
+  单期 ranges 极大时 RPC 响应会变慢，属前端可承受的性能问题，非资金风险。可改为事件重建缓解。
+- **G（澄清）**：FR-T-01 的 90% 针对本项目合约 `Lottery.sol`（行 99.27% / 分支 89.47%，达标）。
+  整体数字偏低仅因含 vendored 的 `ReceiverTemplate.sol`（Chainlink 官方模板）——覆盖率统计
+  已用 `--no-match-coverage "script|mocks|cre"` 排除第三方 vendored 代码。
+- **H（部署方须知）**：构造器要求 `interval > SEAL_GAP`。若把 interval 配得极接近 SEAL_GAP，
+  售票窗口会很短（快节奏验证实例即 2h−75min=45min）。这是部署方的日程选择，Deploy.s.sol
+  正式实例用 2/3 天间隔，无此问题。
+- **I（保留）**：`broadcast/` 是 forge 广播存档，只含公开的交易哈希与地址，按 forge 惯例入库
+  便于复现部署，无敏感值（敏感值在 `cache/`，已忽略）。
+
+## 第二轮后状态
+
+- 测试数：76 个全绿；`Lottery.sol` 行覆盖 99.27% / 分支 89.47%
+- 不变量测试已纳入 s_pendingPot / s_pendingTier1，偿付恒等式仍成立
+- **需再次重新部署**：当前测试网实例 `0xd3820e…00e9` 不含 A/B/D 修复

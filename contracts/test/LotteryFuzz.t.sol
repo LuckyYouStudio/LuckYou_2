@@ -23,7 +23,7 @@ contract LotteryFuzzTest is LotteryTestBase {
         }
         _settleRound(1, uint256(keccak256(abi.encode(seed, "vrf"))));
 
-        (uint32[] memory tickets, address[] memory winners) = lottery.winnersOf(1);
+        (uint32[] memory tickets, address[] memory winners,) = lottery.winnersOf(1);
         for (uint256 i = 0; i < tickets.length; i++) {
             assertLt(tickets[i], total, "winning ticket out of range");
             address holder = _linearOwnerOf(1, tickets[i]);
@@ -131,8 +131,8 @@ contract LotteryDualDecimalsTest is LotteryTestBase {
             );
         }
         // 相同种子与票数分布下，中奖票号完全一致
-        (uint32[] memory tk6,) = l6.winnersOf(1);
-        (uint32[] memory tk18,) = l18.winnersOf(1);
+        (uint32[] memory tk6,,) = l6.winnersOf(1);
+        (uint32[] memory tk18,,) = l18.winnersOf(1);
         assertEq(tk6.length, tk18.length);
         for (uint256 i = 0; i < tk6.length; i++) {
             assertEq(tk6[i], tk18[i], "winning tickets identical across decimals");

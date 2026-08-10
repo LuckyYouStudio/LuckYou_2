@@ -44,8 +44,12 @@ interface LogEntry {
   text: string;
 }
 
+// 计价 token 元数据从链上读取（审计 E：不再硬编码 6 位精度 / USDC / 1e6 票价）
+const TOKEN = { decimals: 6, symbol: "USDC" };
+
 function fmt6(x: bigint): string {
-  return `${(Number(x) / 1e6).toLocaleString("zh-CN", { maximumFractionDigits: 6 })} USDC`;
+  const unit = 10 ** TOKEN.decimals;
+  return `${(Number(x) / unit).toLocaleString("zh-CN", { maximumFractionDigits: TOKEN.decimals })} ${TOKEN.symbol}`;
 }
 
 function fmtTs(t: bigint): string {
@@ -77,9 +81,11 @@ export default function Home() {
   const [fees, setFees] = useState<bigint>(0n);
   const [treasuryBal, setTreasuryBal] = useState<bigint>(0n);
   const [paused, setPaused] = useState(false);
-  const [tierWinners, setTierWinners] = useState<number[]>([1, 2, 5]);
-  const [winners, setWinners] = useState<Map<number, { tickets: number[]; owners: Address[] }>>(new Map());
-  const winnersCache = useRef(new Map<number, { tickets: number[]; owners: Address[] }>());
+  const [ticketPrice, setTicketPrice] = useState<bigint>(0n);
+  const [winners, setWinners] = useState<Map<number, { tickets: number[]; owners: Address[]; tiers: number[] }>>(
+    new Map(),
+  );
+  const winnersCache = useRef(new Map<number, { tickets: number[]; owners: Address[]; tiers: number[] }>());
   const [qty, setQty] = useState("10");
   const [injectAmt, setInjectAmt] = useState("100");
   const [busy, setBusy] = useState<string | null>(null);
@@ -181,13 +187,14 @@ export default function Home() {
       const settled = infos.filter((r) => r.state === 3);
       for (const r of settled) {
         if (winnersCache.current.has(r.id)) continue;
-        const [tickets, owners] = (await publicClient.readContract({
+        // 合约直接返回每个中奖者所属奖级（审计 D），前端不再靠 slot 顺序推断
+        const [tickets, owners, tiers] = (await publicClient.readContract({
           address: addresses.lottery,
           abi: lotteryAbi,
           functionName: "winnersOf",
           args: [r.id],
-        })) as readonly [readonly number[], readonly Address[]];
-        winnersCache.current.set(r.id, { tickets: [...tickets], owners: [...owners] });
+        })) as readonly [readonly number[], readonly Address[], readonly number[]];
+        winnersCache.current.set(r.id, { tickets: [...tickets], owners: [...owners], tiers: [...tiers] });
       }
       setWinners(new Map([...winnersCache.current].filter(([id]) => settled.some((r) => r.id === id))));
 
@@ -233,12 +240,17 @@ export default function Home() {
           functionName: "s_salesPaused",
         })) as boolean,
       );
-      const [, counts] = (await publicClient.readContract({
-        address: addresses.lottery,
-        abi: lotteryAbi,
-        functionName: "getTierConfig",
-      })) as readonly [readonly number[], readonly number[]];
-      setTierWinners([...counts]);
+      // token 元数据与票价是 immutable，只读一次（审计 E）
+      if (ticketPrice === 0n) {
+        const [dec, sym, price] = await Promise.all([
+          publicClient.readContract({ address: addresses.usdc, abi: erc20Abi, functionName: "decimals" }) as Promise<number>,
+          publicClient.readContract({ address: addresses.usdc, abi: erc20Abi, functionName: "symbol" }) as Promise<string>,
+          publicClient.readContract({ address: addresses.lottery, abi: lotteryAbi, functionName: "i_ticketPrice" }) as Promise<bigint>,
+        ]);
+        TOKEN.decimals = dec;
+        TOKEN.symbol = sym;
+        setTicketPrice(price);
+      }
     } catch (e) {
       log("err", `刷新失败：${(e as Error).message.slice(0, 120)}`);
     }
@@ -290,25 +302,13 @@ export default function Home() {
   const drawingRounds = rounds.filter((r) => r.state === 2);
   const cost = useMemo(() => {
     const n = parseInt(qty, 10);
-    return Number.isFinite(n) && n > 0 ? BigInt(n) * 1_000_000n : 0n;
-  }, [qty]);
+    return Number.isFinite(n) && n > 0 ? BigInt(n) * ticketPrice : 0n;
+  }, [qty, ticketPrice]);
   const needApprove = cost > 0n && allowance < cost;
 
   const totalPending = rounds.reduce(
     (sum, r) => sum + r.myPending.reduce((s, x) => s + x, 0n),
     0n,
-  );
-
-  const slotTier = useCallback(
-    (slot: number): number => {
-      let acc = 0;
-      for (let t = 0; t < tierWinners.length; t++) {
-        acc += tierWinners[t];
-        if (slot < acc) return t;
-      }
-      return tierWinners.length - 1;
-    },
-    [tierWinners],
   );
 
   return (
@@ -317,8 +317,8 @@ export default function Home() {
         <span>LuckYou</span> {IS_LOCAL ? "本地测试台" : "Base Sepolia 测试站"}
       </h1>
       <p className="subtitle">
-        {chain.name} (chainId {expectedChainId}) · Lottery <span className="addr">{addresses.lottery}</span> · 票价 1
-        USDC · 抽成 1% ·{" "}
+        {chain.name} (chainId {expectedChainId}) · Lottery <span className="addr">{addresses.lottery}</span> · 票价{" "}
+        {ticketPrice > 0n ? fmt6(ticketPrice) : "…"} · 抽成 1% ·{" "}
         <a href="/history" style={{ color: "var(--blue)" }}>
           我的记录 →
         </a>
@@ -477,8 +477,8 @@ export default function Home() {
               className="btn"
               disabled={busy !== null}
               onClick={() =>
-                act(`注资 ${injectAmt} USDC`, async () => {
-                  const amt = BigInt(Math.round(parseFloat(injectAmt) * 1e6));
+                act(`注资 ${injectAmt} ${TOKEN.symbol}`, async () => {
+                  const amt = BigInt(Math.round(parseFloat(injectAmt) * 10 ** TOKEN.decimals));
                   if (allowance < amt) {
                     await write(addresses.usdc, erc20Abi, "approve", [addresses.lottery, amt]);
                   }
@@ -693,7 +693,7 @@ export default function Home() {
               <tbody>
                 {w.tickets.map((t, i) => (
                   <tr key={i}>
-                    <td>{TIER_NAMES[slotTier(i)]}</td>
+                    <td>{TIER_NAMES[w.tiers[i]] ?? `T${w.tiers[i]}`}</td>
                     <td>#{t}</td>
                     <td className="addr">
                       {w.owners[i]}

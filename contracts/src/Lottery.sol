@@ -97,7 +97,9 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     );
     event PotInjected(uint32 indexed roundId, address indexed sender, uint256 amount);
     event DrawRequested(uint32 indexed roundId, uint256 indexed requestId);
-    event WinnersPicked(uint32 indexed roundId, uint32[] winningTickets, address[] winners);
+    event WinnersPicked(
+        uint32 indexed roundId, uint32[] winningTickets, address[] winners, uint8[] tiers
+    );
     event PrizeClaimed(uint32 indexed roundId, address indexed winner, uint8 tier, uint256 amount);
     event PrizeRolledOver(uint32 indexed fromRound, uint32 indexed toRound, uint256 amount);
     event RoundVoided(uint32 indexed roundId);
@@ -147,6 +149,12 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     uint16 public s_feeBps;
     uint256 public s_accruedFees; // 与奖池分账的运营抽成（FR-C-20）
     bool public s_salesPaused;
+
+    // 滚存缓冲区（2026-08-10 安全修复 A）：过期滚存与未开出奖级的 carry 不再直接注入
+    // s_currentRound（其可能处于封盘期、票已冻结、攻击者可预先卡位为唯一买家），
+    // 而是先入缓冲，由 _openNextRound 在开出新期（拥有完整、未封盘售票窗口）时消费
+    uint256 public s_pendingPot; // 待并入下一新期 pot（过期滚存，FR-C-19）
+    uint256 public s_pendingTier1; // 待并入下一新期一等奖份额（Q1 未开出奖级 carry）
 
     // ===== 构造 =====
 
@@ -322,8 +330,13 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         if (address(s_vrfCoordinator) != i_coordinator) revert CoordinatorTampered();
 
         uint32 roundId = s_requestToRound[requestId];
+        if (roundId == 0) return; // 未登记的 requestId（期号从 1 起）
         Round storage r = s_rounds[roundId];
-        if (r.state != RoundState.DRAWING || r.vrfRequestId != requestId) {
+        // 修复 B：只以 state 为闸，DRAWING 期内先到的合法回调先落定（先到先得）。
+        // 原实现额外校验 requestId == r.vrfRequestId，使 retryDraw 覆写后能作废一个
+        // 即将落地的旧回调 = 重摇。FR-C-15「不能改写已定结果」由 state 闸保证：
+        // 一旦 SETTLED，任何迟到回调都被下面这一句拦下
+        if (r.state != RoundState.DRAWING) {
             return;
         }
 
@@ -355,13 +368,14 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
 
         r.state = RoundState.SETTLED;
         if (carryOut > 0) {
-            uint32 target = s_currentRound; // 始终是 OPEN 或 DRAWING（开奖即开下一期）
-            s_rounds[target].tier1Carry += carryOut;
-            emit PrizeRolledOver(roundId, target, carryOut);
+            // 修复 A：入缓冲，由下一新期消费，不注入可能已封盘的当前期
+            s_pendingTier1 += carryOut;
+            emit PrizeRolledOver(roundId, s_currentRound + 1, carryOut);
         }
 
-        (uint32[] memory tickets, address[] memory winnersArr) = _deriveWinners(roundId);
-        emit WinnersPicked(roundId, tickets, winnersArr);
+        (uint32[] memory tickets, address[] memory winnersArr, uint8[] memory tiers) =
+            _deriveWinners(roundId);
+        emit WinnersPicked(roundId, tickets, winnersArr, tiers);
     }
 
     // ===== 领奖与资金 =====
@@ -415,9 +429,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         }
         if (unclaimed == 0) revert NothingToClaim();
 
-        uint32 target = s_currentRound;
-        s_rounds[target].pot += unclaimed;
-        emit PrizeRolledOver(roundId, target, unclaimed);
+        // 修复 A：入缓冲，由下一新期消费。绝不注入 s_currentRound——它可能正处于
+        // 封盘期、票已冻结，攻击者可预先卡位为唯一买家从而确定性独占这笔过期奖金
+        s_pendingPot += unclaimed;
+        emit PrizeRolledOver(roundId, s_currentRound + 1, unclaimed);
     }
 
     /// @notice 把已分账的运营抽成全额转给 treasury。任何人可触发，资金只会去 treasury
@@ -514,11 +529,11 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         return s_perWinnerAmount[roundId][tier];
     }
 
-    /// @notice 已结算期的全部中奖票与中奖人（按 slot 顺序；未开出的奖级不含在内）
+    /// @notice 已结算期的全部中奖票、中奖人与所属奖级（未开出的奖级不含在内）
     function winnersOf(uint32 roundId)
         external
         view
-        returns (uint32[] memory winningTickets, address[] memory winners)
+        returns (uint32[] memory winningTickets, address[] memory winners, uint8[] memory tiers)
     {
         if (s_rounds[roundId].state != RoundState.SETTLED) revert RoundNotSettled();
         return _deriveWinners(roundId);
@@ -585,8 +600,12 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         Round storage r = s_rounds[newId];
         r.state = RoundState.OPEN;
         r.closeTime = t;
-        r.pot = carryPot;
-        r.tier1Carry = carryTier1;
+        // 消费滚存缓冲区（修复 A）：过期滚存与未开出奖级 carry 在此并入新期，
+        // 新期拥有完整未封盘的售票窗口，无人能预先卡位独占
+        r.pot = carryPot + s_pendingPot;
+        r.tier1Carry = carryTier1 + s_pendingTier1;
+        s_pendingPot = 0;
+        s_pendingTier1 = 0;
         emit RoundOpened(newId, t);
     }
 
@@ -641,11 +660,13 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         return ranges[lo].owner;
     }
 
-    /// @dev 派生全部已开出奖级的中奖票与中奖人
+    /// @dev 派生全部已开出奖级的中奖票、中奖人与所属奖级。
+    ///      返回 tiers 是为了让前端不必假设奖级按前缀顺序开出（非单调 winnerCounts 配置下
+    ///      会错标），也让 FR-C-25 的 WinnersPicked 事件仅靠自身即可还原奖级（审计 D）
     function _deriveWinners(uint32 roundId)
         private
         view
-        returns (uint32[] memory tickets, address[] memory winners)
+        returns (uint32[] memory tickets, address[] memory winners, uint8[] memory tiers)
     {
         Round storage r = s_rounds[roundId];
         uint256 tierCount = s_tierBps.length;
@@ -657,6 +678,7 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         }
         tickets = new uint32[](openSlots);
         winners = new address[](openSlots);
+        tiers = new uint8[](openSlots);
         uint256 idx = 0;
         for (uint8 tier = 0; tier < tierCount; tier++) {
             if (s_perWinnerAmount[roundId][tier] == 0) continue;
@@ -665,6 +687,7 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
                 uint32 ticketId = _winningTicket(r.randomSeed, slotStart + j, r.ticketCount);
                 tickets[idx] = ticketId;
                 winners[idx] = _ownerOfTicket(roundId, ticketId);
+                tiers[idx] = tier;
                 idx++;
             }
         }
