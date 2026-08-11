@@ -6,14 +6,12 @@ import {
     VRFCoordinatorV2_5Mock
 } from "@chainlink/contracts/src/v0.8/vrf/mocks/VRFCoordinatorV2_5Mock.sol";
 import {Lottery} from "../src/Lottery.sol";
-import {MockERC20} from "../src/mocks/MockERC20.sol";
 
 /// @dev 不变量测试 Handler：有界随机调用（FR-T-03）。
 ///      跟踪四个 ghost 量：总购票额、总注资额、总派奖额、总提费额
 contract LotteryHandler is Test {
     Lottery public immutable lottery;
     VRFCoordinatorV2_5Mock public immutable coordinator;
-    MockERC20 public immutable token;
     address public immutable treasury;
 
     address[3] public actors;
@@ -23,15 +21,9 @@ contract LotteryHandler is Test {
     uint256 public totalFeesWithdrawn;
     uint32[] internal drawingRounds;
 
-    constructor(
-        Lottery lottery_,
-        VRFCoordinatorV2_5Mock coordinator_,
-        MockERC20 token_,
-        address treasury_
-    ) {
+    constructor(Lottery lottery_, VRFCoordinatorV2_5Mock coordinator_, address treasury_) {
         lottery = lottery_;
         coordinator = coordinator_;
-        token = token_;
         treasury = treasury_;
         actors[0] = makeAddr("actor0");
         actors[1] = makeAddr("actor1");
@@ -51,25 +43,25 @@ contract LotteryHandler is Test {
         ) {
             return;
         }
-        uint256 cost = uint256(qty) * 1e6;
-        token.mint(actor, cost);
+        uint256 cost = uint256(qty) * 1e14;
+        vm.deal(actor, actor.balance + (cost));
         vm.startPrank(actor);
-        token.approve(address(lottery), cost);
-        lottery.buyTickets(qty);
+        lottery.buyTickets{value: cost}(qty);
         vm.stopPrank();
         totalBought += cost;
     }
 
     function inject(uint256 amount) external {
-        amount = bound(amount, 1, 500e6);
+        amount = bound(amount, 1, 500e14);
         uint32 cur = lottery.s_currentRound();
         (Lottery.RoundState st, uint64 closeTime,,,,,,,) = lottery.getRound(cur);
         if (st != Lottery.RoundState.OPEN || block.timestamp >= closeTime) return;
-        token.mint(address(this), amount);
-        token.approve(address(lottery), amount);
-        lottery.injectPot(cur, amount);
+        vm.deal(address(this), address(this).balance + (amount));
+        lottery.injectPot{value: amount}(cur);
         totalInjected += amount;
     }
+
+    receive() external payable {}
 
     function skipTime(uint256 secs) external {
         secs = bound(secs, 1 hours, 5 days);
@@ -107,10 +99,10 @@ contract LotteryHandler is Test {
         uint32 roundId = uint32(bound(roundSeed, 1, cur));
         tier = uint8(bound(tier, 0, 2));
         address actor = actors[bound(actorSeed, 0, 2)];
-        uint256 before = token.balanceOf(actor);
+        uint256 before = actor.balance;
         vm.prank(actor);
         try lottery.claim(roundId, tier) {
-            totalPrizesPaid += token.balanceOf(actor) - before;
+            totalPrizesPaid += actor.balance - before;
         } catch {}
     }
 
@@ -121,9 +113,9 @@ contract LotteryHandler is Test {
     }
 
     function withdrawFees() external {
-        uint256 before = token.balanceOf(treasury);
+        uint256 before = treasury.balance;
         try lottery.withdrawFees() {
-            totalFeesWithdrawn += token.balanceOf(treasury) - before;
+            totalFeesWithdrawn += treasury.balance - before;
         } catch {}
     }
 
@@ -148,7 +140,6 @@ contract LotteryInvariantTest is Test {
 
     Lottery internal lottery;
     VRFCoordinatorV2_5Mock internal coordinator;
-    MockERC20 internal token;
     LotteryHandler internal handler;
     address internal treasury = makeAddr("treasury");
 
@@ -159,7 +150,6 @@ contract LotteryInvariantTest is Test {
         coordinator = new VRFCoordinatorV2_5Mock(0.1 ether, 1e9, 4e15);
         uint256 subId = coordinator.createSubscription();
         coordinator.fundSubscription(subId, 100_000 ether);
-        token = new MockERC20("Mock USDC", "USDC", 6);
 
         uint32[] memory intervals = new uint32[](3);
         intervals[0] = 2 days;
@@ -178,8 +168,7 @@ contract LotteryInvariantTest is Test {
             address(coordinator),
             subId,
             bytes32(uint256(1)),
-            address(token),
-            1e6,
+            1e14,
             ANCHOR,
             intervals,
             treasury,
@@ -189,7 +178,7 @@ contract LotteryInvariantTest is Test {
         );
         coordinator.addConsumer(subId, address(lottery));
 
-        handler = new LotteryHandler(lottery, coordinator, token, treasury);
+        handler = new LotteryHandler(lottery, coordinator, treasury);
         targetContract(address(handler));
     }
 
@@ -224,7 +213,7 @@ contract LotteryInvariantTest is Test {
             }
             // VOIDED 期的资金已全额转移到下期，贡献为 0
         }
-        uint256 balance = token.balanceOf(address(lottery));
+        uint256 balance = address(lottery).balance;
         assertGe(balance, obligations, "solvency violated");
         assertEq(balance, obligations, "accounting leak detected");
     }
@@ -233,8 +222,7 @@ contract LotteryInvariantTest is Test {
     function invariant_Conservation() public view {
         assertEq(
             handler.totalBought() + handler.totalInjected(),
-            token.balanceOf(address(lottery)) + handler.totalPrizesPaid()
-                + handler.totalFeesWithdrawn(),
+            address(lottery).balance + handler.totalPrizesPaid() + handler.totalFeesWithdrawn(),
             "conservation violated"
         );
     }

@@ -64,7 +64,7 @@ contract LotteryVrfHijackTest is LotteryTestBase {
         // 该期未被污染，奖池分文未动
         assertEq(uint8(_stateOf(1)), uint8(Lottery.RoundState.DRAWING));
         assertEq(lottery.perWinnerAmount(1, 0), 0);
-        assertEq(token.balanceOf(address(lottery)), 100e6);
+        assertEq(address(lottery).balance, 100e14);
     }
 
     /// @dev 请求恒发往钉死的 coordinator：换源后真 coordinator 仍能正常回调结算
@@ -92,6 +92,6 @@ contract LotteryVrfHijackTest is LotteryTestBase {
         _buy(alice, 10);
         _settleRound(1, 42);
         assertEq(uint8(_stateOf(1)), uint8(Lottery.RoundState.SETTLED));
-        assertEq(lottery.perWinnerAmount(1, 0), 594e4);
+        assertEq(lottery.perWinnerAmount(1, 0), 594e12);
     }
 }

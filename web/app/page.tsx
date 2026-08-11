@@ -9,7 +9,6 @@ import {
   advanceTime,
   chain,
   connectInjected,
-  erc20Abi,
   switchToTargetChain,
   walletChainId,
   fmtToken,
@@ -81,7 +80,6 @@ export default function Home() {
   const [rounds, setRounds] = useState<RoundInfo[]>([]);
   const [myRanges, setMyRanges] = useState<{ start: number; end: number }[]>([]);
   const [balance, setBalance] = useState<bigint>(0n);
-  const [allowance, setAllowance] = useState<bigint>(0n);
   const [fees, setFees] = useState<bigint>(0n);
   const [treasuryBal, setTreasuryBal] = useState<bigint>(0n);
   const [paused, setPaused] = useState(false);
@@ -209,26 +207,7 @@ export default function Home() {
       }
       setWinners(new Map([...winnersCache.current].filter(([id]) => settled.some((r) => r.id === id))));
 
-      setBalance(
-        account
-          ? ((await publicClient.readContract({
-              address: addresses.usdc,
-              abi: erc20Abi,
-              functionName: "balanceOf",
-              args: [account],
-            })) as bigint)
-          : 0n,
-      );
-      setAllowance(
-        account
-          ? ((await publicClient.readContract({
-              address: addresses.usdc,
-              abi: erc20Abi,
-              functionName: "allowance",
-              args: [account, addresses.lottery],
-            })) as bigint)
-          : 0n,
-      );
+      setBalance(account ? await publicClient.getBalance({ address: account }) : 0n);
       setFees(
         (await publicClient.readContract({
           address: addresses.lottery,
@@ -249,14 +228,7 @@ export default function Home() {
           functionName: "s_feeBps",
         })) as number,
       );
-      setTreasuryBal(
-        (await publicClient.readContract({
-          address: addresses.usdc,
-          abi: erc20Abi,
-          functionName: "balanceOf",
-          args: [liveTreasury],
-        })) as bigint,
-      );
+      setTreasuryBal(await publicClient.getBalance({ address: liveTreasury }));
       setPaused(
         (await publicClient.readContract({
           address: addresses.lottery,
@@ -280,7 +252,7 @@ export default function Home() {
           args: [cur],
         })) as boolean,
       );
-      // token 精度/符号/票价都是 immutable，共享模块只读一次（审计 E）
+      // 票价是 immutable，共享模块只读一次（审计 E）
       await loadTokenMeta();
       if (ticketPrice !== TOKEN.ticketPrice) setTicketPrice(TOKEN.ticketPrice);
     } catch (e) {
@@ -356,7 +328,13 @@ export default function Home() {
   );
 
   const write = useCallback(
-    async (address: Address, abi: typeof lotteryAbi, functionName: string, args: unknown[]) => {
+    async (
+      address: Address,
+      abi: typeof lotteryAbi,
+      functionName: string,
+      args: unknown[],
+      value?: bigint,
+    ) => {
       if (!account) throw new Error("请先连接钱包");
       // FR-W-05：写操作前校验**钱包**所在链（原实现查的是自家 RPC，恒等于目标链，
       // 永远发现不了用户钱包在别的网络上）——审计第九轮 H3
@@ -374,6 +352,7 @@ export default function Home() {
         args,
         chain,
         account,
+        value,
       });
       // viem 在交易 revert 时也正常 resolve，必须自己查 status，
       // 否则失败的领奖/购票会被报成「成功」，用户以为拿到了钱（审计第九轮 H1）
@@ -387,7 +366,7 @@ export default function Home() {
 
   const current = rounds.find((r) => r.id === currentId);
   const drawingRounds = rounds.filter((r) => r.state === 2);
-  // 严格整数解析并遵守合约的 MAX_TICKETS_PER_TX，避免用户先付了 approve 的 gas
+  // 严格整数解析并遵守合约的 MAX_TICKETS_PER_TX，避免用户白付 gas
   // 才在 buyTickets 撞 ExceedsMaxPerTx（审计第九轮 L1/L2）
   const qtyValid = /^\d+$/.test(qty.trim()) && Number(qty) >= 1 && Number(qty) <= 1000;
   const cost = useMemo(() => {
@@ -395,7 +374,8 @@ export default function Home() {
     const n = Number(qty);
     return n >= 1 && n <= 1000 ? BigInt(n) * ticketPrice : 0n;
   }, [qty, ticketPrice]);
-  const needApprove = cost > 0n && allowance < cost;
+  // 原生币计价下票款与 gas 出自同一余额：余额恰好等于票款也发不出交易
+  const notEnough = cost > 0n && account !== null && balance <= cost;
 
   const totalPending = claimable.reduce((sum, c) => sum + c.amount, 0n);
 
@@ -551,54 +531,41 @@ export default function Home() {
             </div>
           )}
           <div className="row">
-            <span className="k">USDC 余额</span>
+            <span className="k">{TOKEN.symbol} 余额</span>
             <span className="v">{fmt6(balance)}</span>
-          </div>
-          <div className="row">
-            <span className="k">已授权额度</span>
-            <span className="v">{fmt6(allowance)}</span>
           </div>
           <div style={{ marginTop: 8 }}>
             <input value={qty} onChange={(e) => setQty(e.target.value)} placeholder="张数" />
             {!qtyValid && qty.trim() !== "" && (
               <span style={{ color: "var(--red)", fontSize: 12 }}>张数需为 1~1000 的整数</span>
             )}
-            {/* FR-W-02：approve 与 buy 两步独立状态 */}
-            <button
-              className="btn"
-              disabled={busy !== null || !needApprove}
-              onClick={() => act(`授权 ${fmt6(cost)}`, () => write(addresses.usdc, erc20Abi, "approve", [addresses.lottery, cost]))}
-            >
-              {busy?.startsWith("授权") ? "授权中…" : "1️⃣ 授权"}
-            </button>
+            {/* 原生币计价：一步成交，不再需要 approve（FR-C-01） */}
             <button
               className="btn primary"
               disabled={
                 busy !== null ||
                 cost === 0n ||
-                needApprove ||
+                notEnough ||
                 !current ||
                 current.state !== 1 ||
                 !salesOpen ||
                 chainNow >= current.closeTime
               }
-              onClick={() => act(`购买 ${qty} 张`, () => write(addresses.lottery, lotteryAbi, "buyTickets", [parseInt(qty, 10)]))}
+              onClick={() =>
+                act(`购买 ${qty} 张`, () =>
+                  write(addresses.lottery, lotteryAbi, "buyTickets", [parseInt(qty, 10)], cost),
+                )
+              }
             >
-              {busy?.startsWith("购买") ? "购票中…" : `2️⃣ 购票（${fmt6(cost)}）`}
+              {busy?.startsWith("购买") ? "购票中…" : `🎟️ 购票（${fmt6(cost)}）`}
             </button>
+            {notEnough && (
+              <span style={{ color: "var(--red)", fontSize: 12 }}>
+                余额不足（还需留一点付 gas）
+              </span>
+            )}
           </div>
           <div style={{ marginTop: 8 }}>
-            {IS_LOCAL && (
-              <button
-                className="btn"
-                disabled={busy !== null}
-                onClick={() =>
-                  act("领取 10000 测试 USDC", () => write(addresses.usdc, erc20Abi, "mint", [account, 10_000_000_000n]))
-                }
-              >
-                💧 领测试币
-              </button>
-            )}
             <input value={injectAmt} onChange={(e) => setInjectAmt(e.target.value)} placeholder="注资额" />
             <button
               className="btn"
@@ -610,10 +577,7 @@ export default function Home() {
                   // 用整数解析，避免 18 位精度下 JS Number 超出安全整数范围而失真（审计 Low）
                   const amt = parseTokenAmount(injectAmt);
                   if (amt === 0n) throw new Error("注资金额无效");
-                  if (allowance < amt) {
-                    await write(addresses.usdc, erc20Abi, "approve", [addresses.lottery, amt]);
-                  }
-                  await write(addresses.lottery, lotteryAbi, "injectPot", [currentId, amt]);
+                  await write(addresses.lottery, lotteryAbi, "injectPot", [currentId], amt);
                 })
               }
             >

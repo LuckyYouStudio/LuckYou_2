@@ -26,6 +26,7 @@ Chainlink VRF v2.5 提供随机数，Chainlink Automation 触发开奖。目标�
 - **Range 压缩存储**：一次购买只写一条 `[start, end)` 区间，二分反查持有人（FR-C-04/05）
 - **双色球日程**：锚定固定场次（间隔循环 [2d,3d,2d]），封盘期 75 分钟，错过场次自动跳过
 - **奖级** 60% / 25%（2 名）/ 15%（5 名）；票数不足的奖级不开出，奖金滚入下期一等奖份额
+- **原生币计价**：票价 0.0001 ETH，买票一步成交无需授权；避开稳定币发行方的暂停/黑名单风险（FR-C-01）
 - **资金隔离**：奖池与 1% 运营抽成自购票起分账；费率硬上限 10%；
   **不存在任何能挪用奖池的管理员函数**；过期未领奖金滚回奖池
 - **VRF 安全**：回调只记账不转账；超时任何人可重试；旧回调无法覆盖新结果
@@ -50,14 +51,14 @@ npm run sync-abi
 npm run dev        # http://localhost:3000
 ```
 
-测试台提供：购票两步授权、奖池注资、时间快进、模拟 keeper 开奖与 VRF 回调、
+测试台提供：一步购票（原生 ETH，无需授权）、奖池注资、时间快进、模拟 keeper 开奖与 VRF 回调、
 一键领奖、运营面板；`/history` 页从链上事件重建个人购票与领奖记录（无后端）。
 
 ## 测试
 
 ```bash
 cd contracts
-forge test           # 61 个测试：单元 + fuzz + 不变量 + 攻击场景
+forge test           # 111 个测试：单元 + fuzz + 不变量 + 攻击场景
 forge coverage       # Lottery.sol 行覆盖 99.26%，分支 90.74%
 forge snapshot       # gas 基准
 ```
@@ -81,9 +82,8 @@ forge script script/Deploy.s.sol --rpc-url $BASE_SEPOLIA_RPC_URL \
 开奖触发（keeper）：Chainlink Automation 已于 2026 年中弃用（替代品为 CRE），
 测试阶段用自托管轮询 keeper（每分钟 `checkUpkeep`，为真则 `performUpkeep`），
 主网前迁移到 CRE 定时工作流。keeper 不在信任边界内，任何人可触发开奖与重试。
-链上参数（VRF coordinator / keyHash / USDC）已按 chainid 写入脚本，
-来源：[Chainlink VRF v2.5 支持网络](https://docs.chain.link/vrf/v2-5/supported-networks)、
-[Circle USDC 官方地址](https://developers.circle.com/stablecoins/usdc-contract-addresses)。
+链上参数（VRF coordinator / keyHash）已按 chainid 写入脚本，
+来源：[Chainlink VRF v2.5 支持网络](https://docs.chain.link/vrf/v2-5/supported-networks)。
 
 测试网手动运维：`script/Interact.s.sol`（status / buy / poke / retry / claimAll / rollover）。
 
@@ -91,10 +91,11 @@ forge script script/Deploy.s.sol --rpc-url $BASE_SEPOLIA_RPC_URL \
 
 | 函数 | 平均 | 说明 |
 |---|---|---|
-| buyTickets | ~95k | 与张数基本无关（Range 压缩），首次购买含冷存储另计 |
-| claim | ~62k | 单奖级、含转账 |
-| VRF 回调结算 | ~210k | 含 8 个中奖 slot 派生与事件（预算 1M，余量充足） |
-| 部署 | 3.09M / 16.2KB | 低于 24KB 限制 |
+| buyTickets | ~78k | 与张数基本无关（Range 压缩），首次购买含冷存储另计 |
+| claim | ~51k | 单奖级、含原生币转账 |
+| injectPot | ~55k | |
+| VRF 回调结算 | ~203k | 含 8 个中奖 slot 派生与事件（预算 1M，余量充足） |
+| 部署 | 3.74M / 19.99KB | 低于 24KB 限制 |
 
 优化分析结论（未改动）：三个最贵路径分别受制于事件字段（FR-C-25 固定签名要求回调内派生中奖人）、
 每次购买新增一条 Range 的冷存储、以及视图辅助函数带来的部署体积——三者都是规格要求或测试台

@@ -50,13 +50,9 @@ contract LotteryCarryFuzzTest is LotteryTestBase {
     /// @dev 性质：门槛未达标时，carriedPot 与 tier1Carry 必须原样退回缓冲，一分不少
     function testFuzz_ExcessCarryWithheldExactly(uint32 qty, uint256 injectAmt) public {
         qty = uint32(bound(qty, 1, 50)); // 自售额远小于注资额，必定触发扣留
-        injectAmt = bound(injectAmt, 100e6, 1_000_000e6); // 远大于自售额
+        injectAmt = bound(injectAmt, 100e14, 1_000_000e14); // 远大于自售额
 
-        token.mint(carol, injectAmt);
-        vm.startPrank(carol);
-        token.approve(address(lottery), injectAmt);
-        lottery.injectPot(1, injectAmt);
-        vm.stopPrank();
+        _inject(carol, 1, injectAmt);
 
         _buy(bob, qty);
         uint256 carried = lottery.carriedPotOf(1);
@@ -106,10 +102,9 @@ contract LotteryCarryFuzzTest is LotteryTestBase {
         if (pauseMid) lottery.setSalesPaused(true);
 
         // 无论中途怎么切换，本期始终可购
-        token.mint(bob, uint256(qty) * PRICE);
+        vm.deal(bob, bob.balance + (uint256(qty) * PRICE));
         vm.startPrank(bob);
-        token.approve(address(lottery), uint256(qty) * PRICE);
-        lottery.buyTickets(qty);
+        lottery.buyTickets{value: PRICE * qty}(qty);
         vm.stopPrank();
         assertEq(lottery.ticketsOwned(1, bob), qty);
         assertEq(lottery.salesOpenFor(1), openable, "snapshot never changes mid-round");

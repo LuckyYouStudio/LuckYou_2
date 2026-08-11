@@ -12,10 +12,12 @@ contract WindowSniper {
         lottery = l;
     }
 
-    function snipe(uint32 qty) external {
+    function snipe(uint32 qty, uint256 price) external {
         lottery.performUpkeep("");
-        lottery.buyTickets(qty);
+        lottery.buyTickets{value: price * qty}(qty);
     }
+
+    receive() external payable {}
 }
 
 /// @dev 安全回归（2026-08-10 第三轮审计）：操纵「参与者集合」的两条路径。
@@ -29,10 +31,9 @@ contract LotteryFieldControlTest is LotteryTestBase {
         lottery.setSalesPaused(true);
 
         // 其他人照常可买本期——owner 无法把场子清空给自己
-        token.mint(bob, 8e6);
+        vm.deal(bob, bob.balance + (8e14));
         vm.startPrank(bob);
-        token.approve(address(lottery), 8e6);
-        lottery.buyTickets(8); // 不 revert
+        lottery.buyTickets{value: PRICE * 8}(8); // 不 revert
         vm.stopPrank();
         assertEq(lottery.ticketsOwned(1, bob), 8);
     }
@@ -46,19 +47,17 @@ contract LotteryFieldControlTest is LotteryTestBase {
         assertFalse(lottery.salesOpenFor(2), "round 2 opened while paused");
 
         // 其他人买不了
-        token.mint(bob, 8e6);
+        vm.deal(bob, bob.balance + (8e14));
         vm.startPrank(bob);
-        token.approve(address(lottery), 8e6);
         vm.expectRevert(Lottery.SalesArePaused.selector);
-        lottery.buyTickets(8);
+        lottery.buyTickets{value: PRICE * 8}(8);
         vm.stopPrank();
 
         // owner 解禁后自己也买不了这一期（快照已定死），无法独占
         lottery.setSalesPaused(false);
-        token.mint(address(this), 8e6);
-        token.approve(address(lottery), 8e6);
+        vm.deal(address(this), address(this).balance + (8e14));
         vm.expectRevert(Lottery.SalesArePaused.selector);
-        lottery.buyTickets(8);
+        lottery.buyTickets{value: PRICE * 8}(8);
     }
 
     /// @dev #2 核心回归：新期售票窗口不得短于 MIN_SALES_WINDOW，无法被择时压缩
@@ -69,10 +68,8 @@ contract LotteryFieldControlTest is LotteryTestBase {
         vm.warp(nextSlot - 1);
 
         WindowSniper sniper = new WindowSniper(lottery);
-        token.mint(address(sniper), 8e6);
-        vm.prank(address(sniper));
-        token.approve(address(lottery), 8e6);
-        sniper.snipe(8);
+        vm.deal(address(sniper), address(sniper).balance + (8e14));
+        sniper.snipe(8, PRICE);
 
         uint32 sniped = lottery.s_currentRound();
         uint64 window = _closeTimeOf(sniped) - uint64(block.timestamp);
@@ -80,55 +77,48 @@ contract LotteryFieldControlTest is LotteryTestBase {
 
         // 其他人仍有充足时间进场
         vm.warp(block.timestamp + 10 minutes);
-        token.mint(bob, 8e6);
+        vm.deal(bob, bob.balance + (8e14));
         vm.startPrank(bob);
-        token.approve(address(lottery), 8e6);
-        lottery.buyTickets(8); // 不 revert
+        lottery.buyTickets{value: PRICE * 8}(8); // 不 revert
         vm.stopPrank();
     }
 
     /// @dev 参与度门槛：票数不足时滚存/注资不予分配，退回缓冲区顺延
     function test_CarryHeldBackWhenParticipationTooLow() public {
         // 注资一大笔到第 1 期
-        token.mint(carol, 200e6);
-        vm.startPrank(carol);
-        token.approve(address(lottery), 200e6);
-        lottery.injectPot(1, 200e6);
-        vm.stopPrank();
-        assertEq(lottery.carriedPotOf(1), 200e6, "injection counted as carried");
+        _inject(carol, 1, 200e14);
+        assertEq(lottery.carriedPotOf(1), 200e14, "injection counted as carried");
 
         // 只买 8 张（远低于门槛 100）→ 注资不分配
         _buy(bob, 8);
         _settleRound(1, 7);
 
         // 自售额解锁等额 carry，其余退回缓冲（配比释放，FR-C-27）
-        uint256 selfSold = uint256(8e6) * (10000 - uint256(FEE_BPS)) / 10000;
-        assertEq(lottery.s_pendingPot(), 200e6 - selfSold, "excess beyond stake returned to buffer");
+        uint256 selfSold = uint256(8e14) * (10000 - uint256(FEE_BPS)) / 10000;
+        assertEq(
+            lottery.s_pendingPot(), 200e14 - selfSold, "excess beyond stake returned to buffer"
+        );
         // bob 只赢到自己 8 张票的自售奖池（7.92），拿不到 200 注资
-        uint256 before = token.balanceOf(bob);
+        uint256 before = bob.balance;
         vm.startPrank(bob);
         lottery.claim(1, 0);
         lottery.claim(1, 1);
         lottery.claim(1, 2);
         vm.stopPrank();
-        uint256 won = token.balanceOf(bob) - before;
-        assertLe(won, 8e6 * 2, "capture bounded by own stake, not the whole injection");
-        assertLt(won, 200e6, "cannot drain the injection");
+        uint256 won = bob.balance - before;
+        assertLe(won, 8e14 * 2, "capture bounded by own stake, not the whole injection");
+        assertLt(won, 200e14, "cannot drain the injection");
     }
 
     /// @dev 参与度达标时滚存正常分配（门槛不影响正常玩法）
     function test_CarryDistributedWhenParticipationSufficient() public {
-        token.mint(carol, 50e6);
-        vm.startPrank(carol);
-        token.approve(address(lottery), 50e6);
-        lottery.injectPot(1, 50e6);
-        vm.stopPrank();
+        _inject(carol, 1, 50e14);
 
         _buy(alice, 100); // 达到门槛
         _settleRound(1, 7);
 
         assertEq(lottery.s_pendingPot(), 0, "carry distributed, nothing held back");
         // pot = 99（自售净额） + 50（注资）= 149，一等奖 60%
-        assertEq(lottery.perWinnerAmount(1, 0), (149e6 * 6000) / 10000);
+        assertEq(lottery.perWinnerAmount(1, 0), (149e14 * 6000) / 10000);
     }
 }

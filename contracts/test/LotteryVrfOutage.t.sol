@@ -31,10 +31,9 @@ contract LotteryVrfOutageTest is LotteryTestBase {
         assertEq(next, 2, "next round opened despite VRF outage");
         assertEq(uint8(_stateOf(next)), uint8(Lottery.RoundState.OPEN));
 
-        token.mint(bob, 5e6);
+        vm.deal(bob, bob.balance + (5e14));
         vm.startPrank(bob);
-        token.approve(address(lottery), 5e6);
-        lottery.buyTickets(5); // 新期可正常购票
+        lottery.buyTickets{value: PRICE * 5}(5); // 新期可正常购票
         vm.stopPrank();
         assertEq(lottery.ticketsOwned(next, bob), 5);
     }
@@ -56,10 +55,10 @@ contract LotteryVrfOutageTest is LotteryTestBase {
         _fulfill(1, 42);
 
         assertEq(uint8(_stateOf(1)), uint8(Lottery.RoundState.SETTLED));
-        uint256 before = token.balanceOf(alice);
+        uint256 before = alice.balance;
         vm.prank(alice);
         lottery.claim(1, 0);
-        assertGt(token.balanceOf(alice) - before, 0, "funds recovered, prize paid");
+        assertGt(alice.balance - before, 0, "funds recovered, prize paid");
     }
 
     /// @dev 自调用包装不得被外部直接调用

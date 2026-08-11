@@ -2,7 +2,6 @@
 pragma solidity 0.8.26;
 
 import {Script, console} from "forge-std/Script.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Lottery} from "../src/Lottery.sol";
 
 /// @notice 测试网手动交互脚本（FR-D-03）。需要环境变量 LOTTERY_ADDRESS。
@@ -50,18 +49,15 @@ contract Interact is Script {
         }
     }
 
-    /// @notice 购票（自动处理 approve）
+    /// @notice 购票（原生 ETH，无需 approve）
     function buy(uint32 quantity) external {
         Lottery lottery = _lottery();
-        IERC20 token = lottery.i_token();
         uint256 cost = lottery.i_ticketPrice() * quantity;
         vm.startBroadcast();
-        if (token.allowance(msg.sender, address(lottery)) < cost) {
-            token.approve(address(lottery), cost);
-        }
-        lottery.buyTickets(quantity);
+        lottery.buyTickets{value: cost}(quantity);
         vm.stopBroadcast();
         console.log(unicode"已购票（张）:", quantity);
+        console.log(unicode"支付（wei）:", cost);
     }
 
     /// @notice 到点后手动触发开奖（keeper 的手动替身）

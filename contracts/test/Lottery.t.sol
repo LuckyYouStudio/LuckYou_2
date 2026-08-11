@@ -6,16 +6,14 @@ import {
     VRFCoordinatorV2_5Mock
 } from "@chainlink/contracts/src/v0.8/vrf/mocks/VRFCoordinatorV2_5Mock.sol";
 import {Lottery} from "../src/Lottery.sol";
-import {MockERC20} from "../src/mocks/MockERC20.sol";
 
-/// @dev 共享测试基座：VRF mock + 6 位精度 token + 默认参数的 Lottery
+/// @dev 共享测试基座：VRF mock + 原生 ETH 计价 + 默认参数的 Lottery
 contract LotteryTestBase is Test {
     uint64 internal constant ANCHOR = 1_700_000_000;
-    uint256 internal constant PRICE = 1e6; // 1 USDC
+    uint256 internal constant PRICE = 0.0001 ether; // 1e14 wei（FR-C-01）
     uint16 internal constant FEE_BPS = 100; // 1%
 
     VRFCoordinatorV2_5Mock internal coordinator;
-    MockERC20 internal token;
     Lottery internal lottery;
     uint256 internal subId;
 
@@ -29,17 +27,16 @@ contract LotteryTestBase is Test {
         coordinator = new VRFCoordinatorV2_5Mock(0.1 ether, 1e9, 4e15);
         subId = coordinator.createSubscription();
         coordinator.fundSubscription(subId, 1000 ether);
-        token = new MockERC20("Mock USDC", "USDC", 6);
-        lottery = _deployLottery(address(token));
+        lottery = _deployLottery();
         coordinator.addConsumer(subId, address(lottery));
+        vm.deal(address(this), 10_000 ether);
     }
 
-    function _deployLottery(address token_) internal returns (Lottery) {
+    function _deployLottery() internal returns (Lottery) {
         return new Lottery(
             address(coordinator),
             subId,
             bytes32(uint256(1)),
-            token_,
             PRICE,
             ANCHOR,
             _intervals(),
@@ -73,11 +70,16 @@ contract LotteryTestBase is Test {
 
     function _buy(address user, uint32 qty) internal {
         uint256 cost = PRICE * qty;
-        token.mint(user, cost);
-        vm.startPrank(user);
-        token.approve(address(lottery), cost);
-        lottery.buyTickets(qty);
-        vm.stopPrank();
+        vm.deal(user, user.balance + cost);
+        vm.prank(user);
+        lottery.buyTickets{value: cost}(qty);
+    }
+
+    /// @dev 原生币注资
+    function _inject(address from, uint32 roundId, uint256 amount) internal {
+        vm.deal(from, from.balance + amount);
+        vm.prank(from);
+        lottery.injectPot{value: amount}(roundId);
     }
 
     function _closeTimeOf(uint32 roundId) internal view returns (uint64 closeTime) {
@@ -151,7 +153,6 @@ contract LotteryConstructorTest is LotteryTestBase {
             address(coordinator),
             subId,
             bytes32(uint256(1)),
-            address(token),
             PRICE,
             ANCHOR,
             _intervals(),
@@ -170,7 +171,6 @@ contract LotteryConstructorTest is LotteryTestBase {
             address(coordinator),
             subId,
             bytes32(uint256(1)),
-            address(token),
             PRICE,
             ANCHOR,
             _intervals(),
@@ -189,7 +189,6 @@ contract LotteryConstructorTest is LotteryTestBase {
             address(coordinator),
             subId,
             bytes32(uint256(1)),
-            address(token),
             PRICE,
             ANCHOR,
             badIntervals,
@@ -204,10 +203,10 @@ contract LotteryConstructorTest is LotteryTestBase {
 contract LotteryBuyTest is LotteryTestBase {
     function test_BuyTickets_AccountingSplitsPotAndFee() public {
         _buy(alice, 100);
-        // 100 USDC，1% 抽成
-        assertEq(_potOf(1), 99e6, "pot");
-        assertEq(lottery.s_accruedFees(), 1e6, "fees");
-        assertEq(token.balanceOf(address(lottery)), 100e6, "balance");
+        // 100 张 × 0.0001 ETH，1% 抽成
+        assertEq(_potOf(1), 99e14, "pot");
+        assertEq(lottery.s_accruedFees(), 1e14, "fees");
+        assertEq(address(lottery).balance, 100e14, "balance");
         Lottery.TicketRange[] memory ranges = lottery.getRanges(1, 0, type(uint256).max);
         assertEq(ranges.length, 1);
         assertEq(ranges[0].start, 0);
@@ -231,11 +230,10 @@ contract LotteryBuyTest is LotteryTestBase {
 
     function test_RevertWhen_BuyAtOrAfterCloseTime() public {
         vm.warp(_closeTimeOf(1)); // FR-C-09：即使 keeper 未触发也拒绝
-        token.mint(alice, PRICE);
+        vm.deal(alice, alice.balance + (PRICE));
         vm.startPrank(alice);
-        token.approve(address(lottery), PRICE);
         vm.expectRevert(Lottery.SalesClosed.selector);
-        lottery.buyTickets(1);
+        lottery.buyTickets{value: PRICE * 1}(1);
         vm.stopPrank();
     }
 
@@ -246,22 +244,20 @@ contract LotteryBuyTest is LotteryTestBase {
         _buy(alice, 1); // 第 1 期开期时未暂停，仍可购票
         _settleRound(1, 42); // 开出第 2 期时快照 paused=true
 
-        token.mint(bob, PRICE);
+        vm.deal(bob, bob.balance + (PRICE));
         vm.startPrank(bob);
-        token.approve(address(lottery), PRICE);
         vm.expectRevert(Lottery.SalesArePaused.selector);
-        lottery.buyTickets(1);
+        lottery.buyTickets{value: PRICE * 1}(1);
         vm.stopPrank();
     }
 
     function test_RevertWhen_BuyZeroOrOverMax() public {
-        token.mint(alice, PRICE * 2000);
+        vm.deal(alice, alice.balance + (PRICE * 2000));
         vm.startPrank(alice);
-        token.approve(address(lottery), PRICE * 2000);
         vm.expectRevert(Lottery.InvalidQuantity.selector);
-        lottery.buyTickets(0);
+        lottery.buyTickets{value: PRICE * 0}(0);
         vm.expectRevert(Lottery.ExceedsMaxPerTx.selector);
-        lottery.buyTickets(1001); // FR-C-06
+        lottery.buyTickets{value: PRICE * 1001}(1001); // FR-C-06
         vm.stopPrank();
     }
 
@@ -269,14 +265,13 @@ contract LotteryBuyTest is LotteryTestBase {
     function test_Gas_Buy100LessThan3xBuy10() public {
         _buy(carol, 1); // 预热存储槽
 
-        token.mint(alice, PRICE * 110);
+        vm.deal(alice, alice.balance + (PRICE * 110));
         vm.startPrank(alice);
-        token.approve(address(lottery), PRICE * 110);
         uint256 g0 = gasleft();
-        lottery.buyTickets(10);
+        lottery.buyTickets{value: PRICE * 10}(10);
         uint256 gas10 = g0 - gasleft();
         g0 = gasleft();
-        lottery.buyTickets(100);
+        lottery.buyTickets{value: PRICE * 100}(100);
         uint256 gas100 = g0 - gasleft();
         vm.stopPrank();
 
@@ -303,23 +298,18 @@ contract LotteryBuyTest is LotteryTestBase {
     }
 
     function test_InjectPot_AddsToPotWithoutFee() public {
-        token.mint(alice, 50e6);
-        vm.startPrank(alice);
-        token.approve(address(lottery), 50e6);
-        lottery.injectPot(1, 50e6);
-        vm.stopPrank();
-        assertEq(_potOf(1), 50e6);
+        _inject(alice, 1, 50e14);
+        assertEq(_potOf(1), 50e14);
         assertEq(lottery.s_accruedFees(), 0); // FR-C-26 验收：注资不抽成
     }
 
     function test_RevertWhen_InjectNotOpenRound() public {
         _buy(alice, 1);
         _triggerDraw(1); // round1 进入 DRAWING
-        token.mint(alice, 1e6);
+        vm.deal(alice, alice.balance + (1e14));
         vm.startPrank(alice);
-        token.approve(address(lottery), 1e6);
         vm.expectRevert(Lottery.RoundNotOpen.selector);
-        lottery.injectPot(1, 1e6);
+        lottery.injectPot{value: 1e14}(1);
         vm.stopPrank();
     }
 }
@@ -370,20 +360,16 @@ contract LotteryDrawTest is LotteryTestBase {
     /// @dev FR-C-26：VOIDED 期的注资经缓冲区转出（第四轮修复：不再直接注入下期，
     ///      否则可被「让期空转 + 压缩窗口时触发 VOID」绕过按窗口打折的释放规则）
     function test_VoidedRound_InjectionRollsToNextPot() public {
-        token.mint(alice, 50e6);
-        vm.startPrank(alice);
-        token.approve(address(lottery), 50e6);
-        lottery.injectPot(1, 50e6);
-        vm.stopPrank();
+        _inject(alice, 1, 50e14);
 
         vm.warp(_drawTimeOf(1));
         // toRound 恒为 0：进缓冲时去向未定，真正去向由 CarryReleased 给出
         vm.expectEmit(true, true, false, true);
-        emit Lottery.PrizeRolledOver(1, 0, 50e6);
+        emit Lottery.PrizeRolledOver(1, 0, 50e14);
         lottery.performUpkeep("");
 
         // 及时触发 → 缓冲全额释放进新开出的第 2 期
-        assertEq(_potOf(2), 50e6, "released into round 2");
+        assertEq(_potOf(2), 50e14, "released into round 2");
         assertEq(lottery.s_pendingPot(), 0, "buffer drained");
     }
 
@@ -450,10 +436,10 @@ contract LotterySettleClaimTest is LotteryTestBase {
 
     function test_Settle_SplitsPerTierExactly() public {
         _setupSettledRound100();
-        // pot = 99e6：60% / 25%(2名) / 15%(5名)
-        assertEq(lottery.perWinnerAmount(1, 0), 594e5);
-        assertEq(lottery.perWinnerAmount(1, 1), 12_375e3);
-        assertEq(lottery.perWinnerAmount(1, 2), 2_970e3);
+        // pot = 99e14 wei：60% / 25%(2名) / 15%(5名)
+        assertEq(lottery.perWinnerAmount(1, 0), 594e13);
+        assertEq(lottery.perWinnerAmount(1, 1), 12_375e11);
+        assertEq(lottery.perWinnerAmount(1, 2), 297000000000000);
         assertEq(_carryOf(2), 0, unicode"无余数时不应有滚存");
     }
 
@@ -472,10 +458,10 @@ contract LotterySettleClaimTest is LotteryTestBase {
         (, address[] memory winners,) = lottery.winnersOf(1);
         address tier0Winner = winners[0];
 
-        uint256 before = token.balanceOf(tier0Winner);
+        uint256 before = tier0Winner.balance;
         vm.prank(tier0Winner);
         lottery.claim(1, 0);
-        assertEq(token.balanceOf(tier0Winner) - before, 594e5);
+        assertEq(tier0Winner.balance - before, 594e13);
 
         // 重复领取
         vm.prank(tier0Winner);
@@ -491,10 +477,10 @@ contract LotterySettleClaimTest is LotteryTestBase {
             address w = winners[i];
             uint256[] memory pending = lottery.pendingPrizes(1, w);
             if (pending[2] == 0) continue; // 已被同人前次领取
-            uint256 before = token.balanceOf(w);
+            uint256 before = w.balance;
             vm.prank(w);
             lottery.claim(1, 2);
-            assertEq(token.balanceOf(w) - before, pending[2]);
+            assertEq(w.balance - before, pending[2]);
         }
         // 全部领完后 tier2 无剩余
         for (uint256 i = 3; i < 8; i++) {
@@ -538,7 +524,7 @@ contract LotterySettleClaimTest is LotteryTestBase {
         vm.prank(makeAddr("anyone"));
         lottery.rolloverExpired(1);
         // 无人领奖：99e6 全额入缓冲
-        assertEq(lottery.s_pendingPot(), 99e6);
+        assertEq(lottery.s_pendingPot(), 99e14);
 
         vm.expectRevert(Lottery.AlreadyRolledOver.selector);
         lottery.rolloverExpired(1);
@@ -555,14 +541,16 @@ contract LotterySettleClaimTest is LotteryTestBase {
         _buy(alice, 3);
         _settleRound(1, 7);
 
-        // pot = 2.97e6
-        assertEq(lottery.perWinnerAmount(1, 0), 1_782e3, unicode"tier0 照常开出");
+        // pot = 2.97e14 wei
+        assertEq(lottery.perWinnerAmount(1, 0), 178200000000000, unicode"tier0 照常开出");
         assertEq(
-            lottery.perWinnerAmount(1, 1), 371_250, unicode"tier1 照常开出（2 名 <= 3）"
+            lottery.perWinnerAmount(1, 1),
+            37125000000000,
+            unicode"tier1 照常开出（2 名 <= 3）"
         );
         assertEq(lottery.perWinnerAmount(1, 2), 0, unicode"tier2 不开出（5 名 > 3）");
         // 修复 A：carry 先入缓冲区，不直接注入当前期
-        assertEq(lottery.s_pendingTier1(), 445_500, unicode"15% carry 入缓冲");
+        assertEq(lottery.s_pendingTier1(), 44550000000000, unicode"15% carry 入缓冲");
 
         vm.prank(alice);
         vm.expectRevert(Lottery.TierNotOpened.selector);
@@ -573,37 +561,39 @@ contract LotterySettleClaimTest is LotteryTestBase {
     ///      因 FR-C-10「开奖即开下一期」，下一期在本期结算前已开出，故 carry 落在再下一新期
     function test_Q1_CarryPaidIntoLaterTier1() public {
         _buy(alice, 3);
-        _settleRound(1, 7); // carry 445500 入缓冲
-        assertEq(lottery.s_pendingTier1(), 445_500);
+        _settleRound(1, 7); // carry 44550000000000 入缓冲
+        assertEq(lottery.s_pendingTier1(), 44550000000000);
 
         // round2（结算 round1 前已开出）未拿到 carry
         _buy(bob, 100);
         _settleRound(2, 8); // 开出 round3 时消费缓冲
         assertEq(lottery.s_pendingTier1(), 0, "buffer consumed");
-        assertEq(lottery.perWinnerAmount(2, 0), 594e5, "round2 jackpot = its own pot only");
+        assertEq(lottery.perWinnerAmount(2, 0), 594e13, "round2 jackpot = its own pot only");
 
         // carry 落入 round3 的一等奖份额
         _buy(carol, 100);
         _settleRound(3, 9);
-        assertEq(lottery.perWinnerAmount(3, 0), 594e5 + 445_500, "round3 jackpot includes carry");
+        assertEq(
+            lottery.perWinnerAmount(3, 0), 594e13 + 44550000000000, "round3 jackpot includes carry"
+        );
     }
 
     function test_WithdrawFees_DoesNotTouchPots() public {
         _setupSettledRound100();
         _buy(alice, 50); // round2 再积累一点 fee
         uint256 fees = lottery.s_accruedFees();
-        assertEq(fees, 15e5); // 150 张票 × 1%
+        assertEq(fees, 15e13); // 150 张票 × 1%
 
-        uint256 pot1 = 99e6; // round1 已结算未领
+        uint256 pot1 = 99e14; // round1 已结算未领
         uint256 pot2 = _potOf(2);
         vm.prank(makeAddr("anyone"));
         lottery.withdrawFees();
 
-        assertEq(token.balanceOf(treasury), fees);
+        assertEq(treasury.balance, fees);
         assertEq(lottery.s_accruedFees(), 0);
         assertEq(_potOf(2), pot2, unicode"奖池不受影响");
         // FR-C-20 验收：提走全部 fees 后，合约余额仍 ≥ 所有未领奖金
-        assertGe(token.balanceOf(address(lottery)), pot1 + pot2);
+        assertGe(address(lottery).balance, pot1 + pot2);
     }
 
     function test_OwnerCannot_SetFeeAboveCap() public {
@@ -624,20 +614,22 @@ contract LotterySettleClaimTest is LotteryTestBase {
     }
 }
 
-/// @dev FR-T-02：18 位精度 token 下账目一致（完整双精度套件在 M2）
-contract LotteryDecimals18Test is LotteryTestBase {
+/// @dev FR-T-02（原生 ETH 版）：票价规模变化时账目仍然一致。
+///      原条款要求「6 位与 18 位两种 decimals 的 token」，改用原生 ETH 后
+///      精度恒为 18 位，改为验证「票价放大 10000 倍」下的分账等比例
+contract LotteryPriceScaleTest is LotteryTestBase {
+    uint256 internal constant BIG_PRICE = 1 ether; // 默认票价的 10000 倍
+
     function setUp() public override {
         vm.warp(ANCHOR + 1);
         coordinator = new VRFCoordinatorV2_5Mock(0.1 ether, 1e9, 4e15);
         subId = coordinator.createSubscription();
         coordinator.fundSubscription(subId, 1000 ether);
-        token = new MockERC20("Mock DAI", "DAI", 18);
         lottery = new Lottery(
             address(coordinator),
             subId,
             bytes32(uint256(1)),
-            address(token),
-            1e18,
+            BIG_PRICE,
             ANCHOR,
             _intervals(),
             treasury,
@@ -646,23 +638,24 @@ contract LotteryDecimals18Test is LotteryTestBase {
             _tierWinners()
         );
         coordinator.addConsumer(subId, address(lottery));
+        vm.deal(address(this), 10_000 ether);
     }
 
-    function test_Decimals18_AccountingAndClaim() public {
-        token.mint(alice, 100e18);
-        vm.startPrank(alice);
-        token.approve(address(lottery), 100e18);
-        lottery.buyTickets(100);
-        vm.stopPrank();
+    function test_LargeTicketPriceAccountingAndClaim() public {
+        vm.deal(alice, 100 ether);
+        vm.prank(alice);
+        lottery.buyTickets{value: BIG_PRICE * 100}(100);
 
-        assertEq(_potOf(1), 99e18);
-        assertEq(lottery.s_accruedFees(), 1e18);
+        assertEq(_potOf(1), 99 ether, "pot = 99% of 100 ETH");
+        assertEq(lottery.s_accruedFees(), 1 ether, "fee = 1%");
+        assertEq(address(lottery).balance, 100 ether);
 
         _settleRound(1, 42);
-        assertEq(lottery.perWinnerAmount(1, 0), 594e17);
+        assertEq(lottery.perWinnerAmount(1, 0), 59.4 ether, "tier0 = 60% of pot");
 
+        uint256 before = alice.balance;
         vm.prank(alice); // 唯一持票人必中全部奖级
         lottery.claim(1, 0);
-        assertEq(token.balanceOf(alice), 594e17);
+        assertEq(alice.balance - before, 59.4 ether, "native transfer paid exactly");
     }
 }

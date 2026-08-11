@@ -5,8 +5,8 @@ import {Script, console} from "forge-std/Script.sol";
 import {Lottery} from "../src/Lottery.sol";
 import {LocalTestbed} from "./helpers/LocalTestbed.sol";
 
-/// @notice 本地（anvil）一键部署：Mock USDC + VRF mock + Lottery，
-///         预铸测试资金，并把地址写入 web/src/lib/deployment.local.json 供测试前端读取。
+/// @notice 本地（anvil）一键部署：VRF mock + Lottery（原生 ETH 计价，
+///         anvil 账户自带 10000 ETH，无需铸币），地址写入 web/src/lib/deployment.local.json。
 ///         本地没有 Chainlink keeper/VRF 节点，开奖由前端按钮手动触发与模拟回调。
 contract DeployLocal is Script {
     // anvil 默认助记词的前三个账户 + 末位账户（treasury）
@@ -18,13 +18,8 @@ contract DeployLocal is Script {
     function run() external {
         require(block.chainid == 31337, "DeployLocal: anvil only");
 
-        address[] memory funded = new address[](3);
-        funded[0] = ANVIL_0;
-        funded[1] = ANVIL_1;
-        funded[2] = ANVIL_2;
-
         vm.startBroadcast();
-        LocalTestbed testbed = new LocalTestbed(ANVIL_9, msg.sender, funded);
+        LocalTestbed testbed = new LocalTestbed(ANVIL_9, msg.sender);
         Lottery lottery = testbed.lottery();
         lottery.acceptOwnership();
         vm.stopBroadcast();
@@ -33,14 +28,12 @@ contract DeployLocal is Script {
         vm.serializeUint(json, "chainId", block.chainid);
         vm.serializeUint(json, "startBlock", block.number);
         vm.serializeAddress(json, "lottery", address(lottery));
-        vm.serializeAddress(json, "usdc", address(testbed.usdc()));
         vm.serializeAddress(json, "vrfCoordinator", address(testbed.coordinator()));
-        vm.serializeAddress(json, "treasury", ANVIL_9);
-        string memory out = vm.serializeString(json, "subId", vm.toString(testbed.subId()));
+        // 同 Deploy.s.sol：订阅 ID 不写进提交文件（FR-D-04），前端也不需要
+        string memory out = vm.serializeAddress(json, "treasury", ANVIL_9);
         vm.writeJson(out, "../web/src/lib/deployment.local.json");
 
         console.log("Lottery:        ", address(lottery));
-        console.log("Mock USDC:      ", address(testbed.usdc()));
         console.log("VRF Coordinator:", address(testbed.coordinator()));
         console.log("deployment.local.json written to web/src/lib/");
     }

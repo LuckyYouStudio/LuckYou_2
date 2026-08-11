@@ -14,11 +14,10 @@ contract LotteryCallbackGasTest is LotteryTestBase {
 
     function _floodRanges(uint32 count) internal {
         // 每次单张购买产生一条 Range（FR-C-04），这是灌 range 的最廉价方式
-        token.mint(alice, uint256(count) * PRICE);
+        vm.deal(alice, alice.balance + (uint256(count) * PRICE));
         vm.startPrank(alice);
-        token.approve(address(lottery), type(uint256).max);
         for (uint32 i = 0; i < count; i++) {
-            lottery.buyTickets(1);
+            lottery.buyTickets{value: PRICE * 1}(1);
         }
         vm.stopPrank();
     }
@@ -60,10 +59,10 @@ contract LotteryCallbackGasTest is LotteryTestBase {
         // 中奖人仍可由视图派生并正常领奖
         (, address[] memory winners,) = lottery.winnersOf(1);
         assertEq(winners[0], alice);
-        uint256 before = token.balanceOf(alice);
+        uint256 before = alice.balance;
         vm.prank(alice);
         lottery.claim(1, 0);
-        assertGt(token.balanceOf(alice) - before, 0, "prize still claimable");
+        assertGt(alice.balance - before, 0, "prize still claimable");
     }
 
     /// @dev 构造器用 slot 总数上限（<=16）把回调成本限死。
@@ -84,7 +83,6 @@ contract LotteryCallbackGasTest is LotteryTestBase {
             address(coordinator),
             subId,
             bytes32(uint256(1)),
-            address(token),
             PRICE,
             ANCHOR,
             _intervals(),

@@ -20,18 +20,14 @@ contract LotteryViewsTest is LotteryTestBase {
 
     /// @dev distributableEstimate 反映配比释放后的实际可分配上限
     function test_DistributableEstimateReflectsCarryCap() public {
-        token.mint(carol, 1000e6);
-        vm.startPrank(carol);
-        token.approve(address(lottery), 1000e6);
-        lottery.injectPot(1, 1000e6);
-        vm.stopPrank();
+        _inject(carol, 1, 1000e14);
 
         // 尚无自售 → carry 一分也不可分配
         assertEq(lottery.distributableEstimate(1), 0, "no self sales, no carry unlocked");
 
         _buy(bob, 10); // 自售净额 9.9
         // 可分配 = 自售 9.9 + 等额解锁的 carry 9.9
-        assertEq(lottery.distributableEstimate(1), 99e5 * 2, "capped by stake multiple");
+        assertEq(lottery.distributableEstimate(1), 99e13 * 2, "capped by stake multiple");
         assertLt(lottery.distributableEstimate(1), _potOf(1), "far below the face-value pot");
     }
 
@@ -85,12 +81,8 @@ contract LotteryViewsTest is LotteryTestBase {
 
     /// @dev carriedPotOf 在 VOIDED 期归零（资金已转入缓冲）
     function test_CarriedPotClearedOnVoid() public {
-        token.mint(carol, 500e6);
-        vm.startPrank(carol);
-        token.approve(address(lottery), 500e6);
-        lottery.injectPot(1, 500e6);
-        vm.stopPrank();
-        assertEq(lottery.carriedPotOf(1), 500e6);
+        _inject(carol, 1, 500e14);
+        assertEq(lottery.carriedPotOf(1), 500e14);
 
         vm.warp(_drawTimeOf(1));
         lottery.performUpkeep(""); // 零购票 → VOIDED

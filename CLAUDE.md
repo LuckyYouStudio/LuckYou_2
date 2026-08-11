@@ -58,7 +58,7 @@ pnpm lint
 - 外部函数排序：external → public → internal → private，view/pure 放各组末尾
 - 所有 external/public 函数必须有 NatSpec（`@notice` 至少要有）
 - 状态变更必须 emit 事件
-- 转账一律 CEI 顺序 + `SafeERC20`
+- 转账一律 CEI 顺序；原生币出账用 `call{value:}` 并检查返回值，禁用 `transfer`/`send`
 - 用命名 mapping 参数：`mapping(uint32 roundId => Round)`
 
 ## 测试规范

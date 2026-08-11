@@ -13,6 +13,7 @@ contracts/cache/
 node_modules/
 web/.next/
 web/out/
+web/tsconfig.tsbuildinfo
 
 # 系统
 .DS_Store

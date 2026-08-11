@@ -9,7 +9,6 @@ import {Lottery} from "../src/Lottery.sol";
 ///
 /// 链上配置来源（2026-08-07 自官方文档核实，勿凭记忆改动）：
 /// - VRF v2.5：https://docs.chain.link/vrf/v2-5/supported-networks
-/// - USDC（Circle 官方）：https://developers.circle.com/stablecoins/usdc-contract-addresses
 ///
 /// 用法：
 ///   forge script script/Deploy.s.sol --rpc-url $BASE_SEPOLIA_RPC_URL \
@@ -20,7 +19,6 @@ contract Deploy is Script {
         string name;
         address vrfCoordinator;
         bytes32 keyHash;
-        address usdc;
     }
 
     error UnsupportedChain(uint256 chainId);
@@ -72,8 +70,7 @@ contract Deploy is Script {
             cfg.vrfCoordinator,
             subId,
             cfg.keyHash,
-            cfg.usdc,
-            1e6, // 票价 1 USDC（Q4，USDC 为 6 位精度）
+            0.0001 ether, // 票价（FR-C-01，2026-08-11 由 1 USDC 改为原生 ETH）
             anchor,
             intervals,
             treasury,
@@ -90,10 +87,10 @@ contract Deploy is Script {
             vm.serializeUint(json, "chainId", block.chainid);
             vm.serializeUint(json, "startBlock", block.number);
             vm.serializeAddress(json, "lottery", address(lottery));
-            vm.serializeAddress(json, "usdc", cfg.usdc);
             vm.serializeAddress(json, "vrfCoordinator", cfg.vrfCoordinator);
-            vm.serializeAddress(json, "treasury", treasury);
-            string memory out = vm.serializeString(json, "subId", vm.toString(subId));
+            // 不写 subId：FR-D-04 禁止订阅 ID 出现在任何提交的文件里，
+            // 而这个 JSON 是要提交的前端配置（前端也不需要它）
+            string memory out = vm.serializeAddress(json, "treasury", treasury);
             vm.writeJson(out, "../web/src/lib/deployment.base-sepolia.json");
         }
 
@@ -124,16 +121,14 @@ contract Deploy is Script {
             return NetworkConfig({
                 name: "Base Sepolia",
                 vrfCoordinator: 0x5C210eF41CD1a72de73bF76eC39637bB0d3d7BEE,
-                keyHash: 0x9e1344a1247c8a1785d0a4681a27152bffdb43666ae5bf7d14d24a5efd44bf71, // 30 gwei lane
-                usdc: 0x036CbD53842c5426634e7929541eC2318f3dCF7e
+                keyHash: 0x9e1344a1247c8a1785d0a4681a27152bffdb43666ae5bf7d14d24a5efd44bf71 // 30 gwei lane
             });
         }
         if (chainId == 8453) {
             return NetworkConfig({
                 name: "Base Mainnet",
                 vrfCoordinator: 0xd5D517aBE5cF79B7e95eC98dB0f0277788aFF634,
-                keyHash: 0x00b81b5a830cb0a4009fbd8904de511e28631e62ce5ad231373d3cdad373ccab, // 2 gwei lane
-                usdc: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+                keyHash: 0x00b81b5a830cb0a4009fbd8904de511e28631e62ce5ad231373d3cdad373ccab // 2 gwei lane
             });
         }
         revert UnsupportedChain(chainId); // 本地请用 DeployLocal.s.sol

@@ -11,25 +11,26 @@ import {
 import {
     AutomationCompatibleInterface
 } from "@chainlink/contracts/src/v0.8/automation/interfaces/AutomationCompatibleInterface.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title 链上周期开奖彩票
 /// @notice 抽签制彩票：按双色球日程（锚定固定场次）售票，Chainlink VRF v2.5 开奖，
 ///         keeper 触发。奖池与运营抽成自购票时刻起分账（FR-C-20），
 ///         不存在任何能挪用奖池的管理员函数（FR-C-24）。
-/// @dev 计价 token 必须是标准 ERC20：**不支持**转账扣费（fee-on-transfer）或
-///      弹性供给（rebasing）代币——这两类会使名义记账与实际到账不符，
-///      击穿「合约余额 >= 全部未领奖金」的偿付性不变量。
+/// @dev 计价资产为**链原生币（ETH）**（FR-C-01，2026-08-11 由 USDC 变更）。
+///      理由：ERC20 稳定币由发行方掌控，可暂停/黑名单/升级，合约地址一旦被拉黑
+///      则买票、领奖、提抽成同时失效且无救援手段；原生币无发行方，且省掉 approve。
+///      代价：ETH 价格波动会影响奖池实际购买力——这是刻意接受的取舍。
+/// @dev 无 `receive`/`fallback`：只能经 buyTickets / injectPot 两个 payable 入口付款。
+///      误转入的 ETH 无法退回，也会破坏偿付性不变量，因此干脆不接收。
+///      所有转出用 `call{value:}` 并检查返回值；因原生转账会执行接收方代码，
+///      转出路径一律 CEI + nonReentrant。
 /// @dev owner 权限完整清单见 FR-C-22 说明：setTreasury / setFeeBps / setSalesPaused，
 ///      外加继承自 ConfirmedOwner 的 transferOwnership / acceptOwnership，
 ///      以及继承自 VRFConsumerBaseV2Plus 的 setCoordinator（无法 override 封禁，
 ///      但换源后回调会被 CoordinatorTampered 拒绝，只能造成可自行恢复的延迟，
 ///      无法操纵开奖或挪用资金）。
 contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, ReentrancyGuard {
-    using SafeERC20 for IERC20;
-
     // ===== 类型 =====
 
     enum RoundState {
@@ -86,12 +87,13 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     error AlreadyRolledOver();
     error FeeTooHigh();
     error InvalidTreasury();
-    error InvalidToken();
     error InvalidTicketPrice();
     error InvalidSchedule();
     error InvalidTierConfig();
     error NoFeesToWithdraw();
     error CoordinatorTampered();
+    error TransferFailed();
+    error IncorrectPayment();
     error OnlySelf();
 
     // ===== 事件（FR-C-25）=====
@@ -161,7 +163,6 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
 
     // ===== 不可变配置 =====
 
-    IERC20 public immutable i_token; // FR-C-01
     uint256 public immutable i_ticketPrice;
     bytes32 public immutable i_keyHash;
     uint256 public immutable i_subId;
@@ -201,8 +202,7 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     /// @param vrfCoordinator VRF v2.5 coordinator 地址
     /// @param subId VRF 订阅 ID
     /// @param keyHash VRF gas lane
-    /// @param token 计价 ERC20（默认 USDC，精度不做假设）
-    /// @param ticketPrice 票价（token 最小单位）
+    /// @param ticketPrice 票价（wei）。部署默认 0.0001 ether
     /// @param anchorTime 日程锚点（如某个周二 12:00 UTC）
     /// @param intervals 场次间隔循环（秒），如 [2 days, 3 days, 2 days]
     /// @param treasury 运营抽成接收地址
@@ -213,7 +213,6 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         address vrfCoordinator,
         uint256 subId,
         bytes32 keyHash,
-        address token,
         uint256 ticketPrice,
         uint64 anchorTime,
         uint32[] memory intervals,
@@ -222,7 +221,6 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         uint16[] memory tierBps,
         uint8[] memory tierWinnerCounts
     ) VRFConsumerBaseV2Plus(vrfCoordinator) {
-        if (token == address(0)) revert InvalidToken();
         if (ticketPrice == 0) revert InvalidTicketPrice();
         if (treasury == address(0)) revert InvalidTreasury();
         if (feeBps > MAX_FEE_BPS) revert FeeTooHigh();
@@ -248,7 +246,6 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         // 那条校验永远不触发、只制造虚假安全感，已移除（第四轮复查 M-4）。
         // 回调 gas 的真正保障是：中奖人派生已移出回调，其成本与 range 数无关
 
-        i_token = IERC20(token);
         i_ticketPrice = ticketPrice;
         i_keyHash = keyHash;
         i_subId = subId;
@@ -266,8 +263,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
 
     // ===== 购票与注资 =====
 
-    /// @notice 购买连续票号的彩票，一次购买只写入一条 Range（FR-C-04）
-    function buyTickets(uint32 quantity) external {
+    /// @notice 购买连续票号的彩票，一次购买只写入一条 Range（FR-C-04）。
+    /// @dev msg.value **必须恰好**等于 票价 × 张数：多付不自动退还——退款是额外的
+    ///      外部调用，会平白扩大重入面（FR-C-03）
+    function buyTickets(uint32 quantity) external payable {
         uint32 roundId = s_currentRound;
         Round storage r = s_rounds[roundId];
         // 用开期快照而非全局标志：暂停对「已开出的期」无效，owner 无法中途清场后自购
@@ -281,6 +280,7 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
 
         uint32 start = r.ticketCount;
         uint256 cost = i_ticketPrice * quantity;
+        if (msg.value != cost) revert IncorrectPayment();
         // 用开期快照而非实时费率：否则 owner 可抢跑大额购票临时把 1% 抬到 10%，
         // 差额从奖池里吃走（审计第四轮，与 salesPausedAtOpen 同构）
         uint256 fee = (cost * r.feeBpsAtOpen) / BPS_DENOMINATOR;
@@ -292,21 +292,20 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         );
 
         emit TicketsBought(roundId, msg.sender, start, quantity);
-        i_token.safeTransferFrom(msg.sender, address(this), cost);
     }
 
     /// @notice 冷启动/活动注资：任何人可向售票中的期注入奖金，全额进奖池、不抽成（FR-C-26）
     /// @dev 与 buyTickets 共用同一时间闸（FR-C-09）：停售后不得再改变本期奖池规模
-    function injectPot(uint32 roundId, uint256 amount) external {
+    function injectPot(uint32 roundId) external payable {
         Round storage r = s_rounds[roundId];
         if (r.state != RoundState.OPEN) revert RoundNotOpen();
         if (block.timestamp >= r.closeTime) revert SalesClosed();
+        uint256 amount = msg.value;
         if (amount == 0) revert InvalidQuantity();
         r.pot += amount;
-        // 注资同样是「非本期自售」的钱，受参与度门槛保护，避免被小额独占
+        // 注资同样是「非本期自售」的钱，受配比释放约束，避免被小额独占
         r.carriedPot += amount;
         emit PotInjected(roundId, msg.sender, amount);
-        i_token.safeTransferFrom(msg.sender, address(this), amount);
     }
 
     // ===== 开奖（Automation + VRF）=====
@@ -480,7 +479,7 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         if (total == 0) revert NothingToClaim();
 
         emit PrizeClaimed(roundId, msg.sender, tier, total);
-        i_token.safeTransfer(msg.sender, total);
+        _sendValue(msg.sender, total);
     }
 
     /// @notice 领奖窗口结束后，任何人可把该期未领奖金滚入当前期奖池（FR-C-19）
@@ -515,13 +514,13 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     }
 
     /// @notice 把已分账的运营抽成全额转给 treasury。任何人可触发，资金只会去 treasury
-    function withdrawFees() external {
+    function withdrawFees() external nonReentrant {
         uint256 amount = s_accruedFees;
         if (amount == 0) revert NoFeesToWithdraw();
         s_accruedFees = 0;
         address treasury = s_treasury;
         emit FeesWithdrawn(treasury, amount);
-        i_token.safeTransfer(treasury, amount);
+        _sendValue(treasury, amount);
     }
 
     // ===== owner 权限（仅限 FR-C-22 列出的三项）=====
@@ -821,6 +820,13 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         // 开期时 pot 全部来自 carry（本期尚无自售），据此建立配比释放的基线
         r.carriedPot = r.pot;
         emit RoundOpened(newId, t);
+    }
+
+    /// @dev 原生币转出：用 call 而非 transfer/send（后者 2300 gas 上限会让多签等
+    ///      合约钱包收不到款）。必须检查返回值——call 失败只返回 false 不会自动 revert
+    function _sendValue(address to, uint256 amount) private {
+        (bool ok,) = payable(to).call{value: amount}("");
+        if (!ok) revert TransferFailed();
     }
 
     /// @notice 仅供本合约自调用，用于把 VRF 请求包进 try/catch。外部调用一律拒绝

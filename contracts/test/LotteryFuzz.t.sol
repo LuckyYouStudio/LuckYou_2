@@ -5,7 +5,6 @@ import {
     VRFCoordinatorV2_5Mock
 } from "@chainlink/contracts/src/v0.8/vrf/mocks/VRFCoordinatorV2_5Mock.sol";
 import {Lottery} from "../src/Lottery.sol";
-import {MockERC20} from "../src/mocks/MockERC20.sol";
 import {LotteryTestBase} from "./Lottery.t.sol";
 
 /// @dev FR-T-02 性质测试
@@ -50,35 +49,33 @@ contract LotteryFuzzTest is LotteryTestBase {
             }
         }
 
-        uint256 balancesBefore =
-            token.balanceOf(alice) + token.balanceOf(bob) + token.balanceOf(carol);
+        uint256 balancesBefore = alice.balance + bob.balance + carol.balance;
         for (uint256 u = 0; u < 3; u++) {
             for (uint8 tier = 0; tier < 3; tier++) {
                 vm.prank(users[u]);
                 try lottery.claim(1, tier) {} catch {}
             }
         }
-        uint256 paid =
-            token.balanceOf(alice) + token.balanceOf(bob) + token.balanceOf(carol) - balancesBefore;
+        uint256 paid = alice.balance + bob.balance + carol.balance - balancesBefore;
         assertEq(paid, distributed, "total paid must equal distributed exactly");
     }
 }
 
-/// @dev FR-T-02：6 位与 18 位精度下，同一场景账目完全成比例
-contract LotteryDualDecimalsTest is LotteryTestBase {
-    function _deployStack(uint8 decimals, uint256 price)
+/// @dev FR-T-02（原生 ETH 版）：不同票价规模下账目等比例。
+///      原为「6 位 vs 18 位 decimals」的双精度对照，改用原生 ETH 后精度恒为 18 位，
+///      改为验证「票价放大 10000 倍」时分账结果严格等比例
+contract LotteryPriceParityTest is LotteryTestBase {
+    function _deployWithPrice(uint256 price)
         internal
-        returns (Lottery l, MockERC20 t, VRFCoordinatorV2_5Mock c)
+        returns (Lottery l, VRFCoordinatorV2_5Mock c)
     {
         c = new VRFCoordinatorV2_5Mock(0.1 ether, 1e9, 4e15);
         uint256 sid = c.createSubscription();
         c.fundSubscription(sid, 1000 ether);
-        t = new MockERC20("T", "T", decimals);
         l = new Lottery(
             address(c),
             sid,
             bytes32(uint256(1)),
-            address(t),
             price,
             ANCHOR,
             _intervals(),
@@ -90,18 +87,14 @@ contract LotteryDualDecimalsTest is LotteryTestBase {
         c.addConsumer(sid, address(l));
     }
 
-    function _runScenario(Lottery l, MockERC20 t, VRFCoordinatorV2_5Mock c, uint256 price)
-        internal
-    {
+    function _runScenario(Lottery l, VRFCoordinatorV2_5Mock c, uint256 price) internal {
         address[3] memory users = [alice, bob, carol];
         uint32[3] memory qtys = [uint32(13), 27, 60];
         for (uint256 i = 0; i < 3; i++) {
             uint256 cost = price * qtys[i];
-            t.mint(users[i], cost);
-            vm.startPrank(users[i]);
-            t.approve(address(l), cost);
-            l.buyTickets(qtys[i]);
-            vm.stopPrank();
+            vm.deal(users[i], users[i].balance + cost);
+            vm.prank(users[i]);
+            l.buyTickets{value: cost}(qtys[i]);
         }
         vm.warp(ANCHOR + 2 days + 75 minutes);
         l.performUpkeep("");
@@ -111,31 +104,32 @@ contract LotteryDualDecimalsTest is LotteryTestBase {
         c.fulfillRandomWordsWithOverride(requestId, address(l), words);
     }
 
-    function test_DualDecimals_ScenarioParity() public {
-        (Lottery l6, MockERC20 t6, VRFCoordinatorV2_5Mock c6) = _deployStack(6, 1e6);
-        _runScenario(l6, t6, c6, 1e6);
-        vm.warp(ANCHOR + 1); // 时间复位，跑 18 位场景
-        (Lottery l18, MockERC20 t18, VRFCoordinatorV2_5Mock c18) = _deployStack(18, 1e18);
-        _runScenario(l18, t18, c18, 1e18);
+    function test_PriceScaleParity() public {
+        (Lottery small, VRFCoordinatorV2_5Mock cs) = _deployWithPrice(PRICE);
+        _runScenario(small, cs, PRICE);
 
-        uint256 scale = 1e12;
-        (,,,, uint256 pot6,,,,) = l6.getRound(1);
-        (,,,, uint256 pot18,,,,) = l18.getRound(1);
-        assertEq(pot18, pot6 * scale, "pot parity");
-        assertEq(l18.s_accruedFees(), l6.s_accruedFees() * scale, "fee parity");
+        vm.warp(ANCHOR + 1); // 时间复位
+        uint256 bigPrice = PRICE * 10_000;
+        (Lottery big, VRFCoordinatorV2_5Mock cb) = _deployWithPrice(bigPrice);
+        _runScenario(big, cb, bigPrice);
+
+        uint256 scale = 10_000;
+        (,,,, uint256 potSmall,,,,) = small.getRound(1);
+        (,,,, uint256 potBig,,,,) = big.getRound(1);
+        assertEq(potBig, potSmall * scale, "pot parity");
+        assertEq(big.s_accruedFees(), small.s_accruedFees() * scale, "fee parity");
         for (uint8 tier = 0; tier < 3; tier++) {
             assertEq(
-                l18.perWinnerAmount(1, tier),
-                l6.perWinnerAmount(1, tier) * scale,
+                big.perWinnerAmount(1, tier),
+                small.perWinnerAmount(1, tier) * scale,
                 "perWinner parity"
             );
         }
-        // 相同种子与票数分布下，中奖票号完全一致
-        (uint32[] memory tk6,,) = l6.winnersOf(1);
-        (uint32[] memory tk18,,) = l18.winnersOf(1);
-        assertEq(tk6.length, tk18.length);
-        for (uint256 i = 0; i < tk6.length; i++) {
-            assertEq(tk6[i], tk18[i], "winning tickets identical across decimals");
+        // 同种子同票数分布下，中奖票号与票价无关
+        (uint32[] memory tkSmall,,) = small.winnersOf(1);
+        (uint32[] memory tkBig,,) = big.winnersOf(1);
+        for (uint256 i = 0; i < tkSmall.length; i++) {
+            assertEq(tkSmall[i], tkBig[i], "winning tickets identical across price scales");
         }
     }
 }

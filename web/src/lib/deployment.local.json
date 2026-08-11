@@ -1,8 +1,7 @@
 {
   "chainId": 31337,
-  "lottery": "0x788F1E4a99fa704Edb43fAE71946cFFDDcC16ccB",
+  "lottery": "0x7271bB9B1aC865307Ed2d730662639CB90b20A69",
+  "startBlock": 401,
   "treasury": "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720",
-  "usdc": "0x8aCd85898458400f7Db866d53FCFF6f0D49741FF",
-  "vrfCoordinator": "0xe082b26cEf079a095147F35c9647eC97c2401B83",
-  "startBlock": 0
+  "vrfCoordinator": "0xD778E110C66d2E3A8A92cE9D64924DB2b8B24C60"
 }

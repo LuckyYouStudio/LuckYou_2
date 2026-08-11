@@ -6,12 +6,10 @@ out/
 .logs/
 .ignore/
 
-# Ignores development broadcast logs
-!/broadcast
-/broadcast/*/31337/
-/broadcast/**/dry-run/
-# 每次部署都会新增一份时间戳快照，与 run-latest.json 内容重复；只保留后者作存档
-/broadcast/**/run-[0-9]*.json
+# 广播记录一律不入库：run-latest.json 会把构造参数原样存下，其中包含 VRF 订阅 ID，
+# 而 FR-D-04 禁止订阅 ID 出现在任何提交的文件里。存档价值（合约地址 + 起始块）
+# 已由 web/src/lib/deployment.*.json 覆盖，那份不含任何敏感值。
+/broadcast/
 
 # Docs
 docs/

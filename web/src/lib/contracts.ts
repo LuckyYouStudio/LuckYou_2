@@ -15,11 +15,9 @@ import { baseSepolia } from "viem/chains";
 import deploymentLocal from "./deployment.local.json";
 import deploymentBaseSepolia from "./deployment.base-sepolia.json";
 import lotteryAbiJson from "./abi/Lottery.json";
-import erc20AbiJson from "./abi/MockERC20.json";
 import vrfAbiJson from "./abi/VRFCoordinatorV2_5Mock.json";
 
 export const lotteryAbi = lotteryAbiJson as Abi;
-export const erc20Abi = erc20AbiJson as Abi;
 export const vrfAbi = vrfAbiJson as Abi;
 
 const NETWORK = process.env.NEXT_PUBLIC_NETWORK ?? "local";
@@ -38,7 +36,6 @@ const deployment = IS_LOCAL ? deploymentLocal : deploymentBaseSepolia;
 
 export const addresses = {
   lottery: deployment.lottery as Address,
-  usdc: deployment.usdc as Address,
   vrfCoordinator: deployment.vrfCoordinator as Address,
   treasury: deployment.treasury as Address,
 } as const;
@@ -178,36 +175,28 @@ export function injectedWalletFor(account: Address) {
   return createWalletClient({ chain, transport: custom(provider), account });
 }
 
-// ===== 计价 token 元数据（审计 E：不硬编码精度/符号/票价，一律从链上读）=====
+// ===== 计价资产元数据（FR-C-01：链原生币 ETH）=====
+// 精度与符号由链定义（viem chain.nativeCurrency），票价仍从链上读——
+// 审计 E 的要求是「界面不得自作主张地写死票价」，改用原生币后这一条依然成立。
 
-export const TOKEN = { decimals: 6, symbol: "USDC", ticketPrice: 0n as bigint, loaded: false };
+export const TOKEN = {
+  decimals: chain.nativeCurrency.decimals,
+  symbol: chain.nativeCurrency.symbol,
+  ticketPrice: 0n as bigint,
+  loaded: false,
+};
 
 let tokenMetaPromise: Promise<void> | null = null;
 
-/** 读取并缓存 token 精度、符号与票价（都是 immutable，只读一次） */
+/** 读取并缓存票价（immutable，只读一次） */
 export function loadTokenMeta(): Promise<void> {
   if (!tokenMetaPromise) {
     tokenMetaPromise = (async () => {
-      const [decimals, symbol, price] = await Promise.all([
-        publicClient.readContract({
-          address: addresses.usdc,
-          abi: erc20Abi,
-          functionName: "decimals",
-        }) as Promise<number>,
-        publicClient.readContract({
-          address: addresses.usdc,
-          abi: erc20Abi,
-          functionName: "symbol",
-        }) as Promise<string>,
-        publicClient.readContract({
-          address: addresses.lottery,
-          abi: lotteryAbi,
-          functionName: "i_ticketPrice",
-        }) as Promise<bigint>,
-      ]);
-      TOKEN.decimals = decimals;
-      TOKEN.symbol = symbol;
-      TOKEN.ticketPrice = price;
+      TOKEN.ticketPrice = (await publicClient.readContract({
+        address: addresses.lottery,
+        abi: lotteryAbi,
+        functionName: "i_ticketPrice",
+      })) as bigint;
       TOKEN.loaded = true;
     })().catch((e) => {
       tokenMetaPromise = null; // 允许重试
@@ -217,16 +206,19 @@ export function loadTokenMeta(): Promise<void> {
   return tokenMetaPromise;
 }
 
-/** 按 token 精度格式化金额 */
+/** 按原生币精度格式化金额。18 位精度下金额普遍很小，保留足够有效位而非固定截断 */
 export function fmtToken(x: bigint): string {
-  const s = x.toString().padStart(TOKEN.decimals + 1, "0");
-  const int = s.slice(0, s.length - TOKEN.decimals);
-  const frac = TOKEN.decimals > 0 ? s.slice(s.length - TOKEN.decimals).replace(/0+$/, "") : "";
+  const d = TOKEN.decimals;
+  const s = x.toString().padStart(d + 1, "0");
+  const int = s.slice(0, s.length - d);
+  let frac = d > 0 ? s.slice(s.length - d).replace(/0+$/, "") : "";
+  // 只在整数部分为 0 时保留长尾小数（0.0001 ETH 这类），否则截到 6 位够读
+  if (int !== "0" && frac.length > 6) frac = frac.slice(0, 6).replace(/0+$/, "");
   const intFmt = Number(int).toLocaleString("zh-CN");
   return `${intFmt}${frac ? `.${frac}` : ""} ${TOKEN.symbol}`;
 }
 
-/** 把用户输入的小数金额转成 token 最小单位（避免 JS Number 在 18 位精度下失真） */
+/** 把用户输入的小数金额转成 wei（避免 JS Number 在 18 位精度下失真） */
 export function parseTokenAmount(input: string): bigint {
   const trimmed = input.trim();
   if (!/^\d*\.?\d*$/.test(trimmed) || trimmed === "" || trimmed === ".") return 0n;

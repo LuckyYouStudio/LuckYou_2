@@ -19,12 +19,10 @@ contract LotteryOwnerTimingTest is LotteryTestBase {
         (, address[] memory winners,) = lottery.winnersOf(1);
         assertEq(winners[0], alice);
 
-        uint256 before = token.balanceOf(alice);
+        uint256 before = alice.balance;
         vm.prank(alice);
         lottery.claim(1, 0); // 修复前这里 revert ClaimWindowClosed
-        assertGt(
-            token.balanceOf(alice) - before, 0, "winner can still claim after delayed settlement"
-        );
+        assertGt(alice.balance - before, 0, "winner can still claim after delayed settlement");
     }
 
     /// @dev 结算延迟期间，第三方无法提前把奖金扫走
@@ -63,27 +61,26 @@ contract LotteryOwnerTimingTest is LotteryTestBase {
         lottery.setFeeBps(1000);
 
         // 受害者购票：仍按开期时的 1% 计费
-        token.mint(bob, 1000e6);
+        vm.deal(bob, bob.balance + (1000e14));
         vm.startPrank(bob);
-        token.approve(address(lottery), 1000e6);
-        lottery.buyTickets(1000);
+        lottery.buyTickets{value: PRICE * 1000}(1000);
         vm.stopPrank();
 
-        assertEq(lottery.s_accruedFees(), 10e6, "fee charged at the rate snapshotted at open");
-        assertEq(_potOf(1), 990e6, "pot keeps 99%, not 90%");
+        assertEq(lottery.s_accruedFees(), 10e14, "fee charged at the rate snapshotted at open");
+        assertEq(_potOf(1), 990e14, "pot keeps 99%, not 90%");
     }
 
     /// @dev 费率变更在下一期开出时生效（正常调价路径不受影响）
     function test_FeeChangeAppliesFromNextRound() public {
         lottery.setFeeBps(500); // 5%
         _buy(alice, 100); // 第 1 期仍按 1%
-        assertEq(lottery.s_accruedFees(), 1e6);
+        assertEq(lottery.s_accruedFees(), 1e14);
 
         _settleRound(1, 42); // 开出第 2 期，快照 5%
         uint32 r = lottery.s_currentRound();
         _buy(bob, 100);
-        // 第 2 期按 5% 计费：100 USDC * 5% = 5
-        assertEq(lottery.s_accruedFees(), 1e6 + 5e6, "new rate applies to the next round");
-        assertEq(_potOf(r), 95e6);
+        // 第 2 期按 5% 计费：100 张票款 * 5%
+        assertEq(lottery.s_accruedFees(), 1e14 + 5e14, "new rate applies to the next round");
+        assertEq(_potOf(r), 95e14);
     }
 }

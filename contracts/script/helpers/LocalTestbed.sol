@@ -5,19 +5,16 @@ import {
     VRFCoordinatorV2_5Mock
 } from "@chainlink/contracts/src/v0.8/vrf/mocks/VRFCoordinatorV2_5Mock.sol";
 import {Lottery} from "../../src/Lottery.sol";
-import {MockERC20} from "../../src/mocks/MockERC20.sol";
 
 /// @notice 本地测试台：在单笔交易内完成全部部署与接线。
 ///         VRF mock 的 subId 由 blockhash 派生，拆成多笔交易会导致脚本模拟值与
 ///         链上实际值不一致，因此必须在一个构造函数里一气呵成。
 contract LocalTestbed {
-    MockERC20 public immutable usdc;
     VRFCoordinatorV2_5Mock public immutable coordinator;
     Lottery public immutable lottery;
     uint256 public immutable subId;
 
-    constructor(address treasury, address pendingOwner, address[] memory fundedAccounts) {
-        usdc = new MockERC20("Mock USDC", "USDC", 6);
+    constructor(address treasury, address pendingOwner) {
         coordinator = new VRFCoordinatorV2_5Mock(0.1 ether, 1e9, 4e15);
         subId = coordinator.createSubscription();
         coordinator.fundSubscription(subId, 1000 ether);
@@ -39,8 +36,7 @@ contract LocalTestbed {
             address(coordinator),
             subId,
             bytes32(uint256(1)), // 本地 mock 不校验 keyHash
-            address(usdc),
-            1e6, // 票价 1 USDC（Q4）
+            0.0001 ether, // 票价（FR-C-01）
             uint64(block.timestamp),
             intervals,
             treasury,
@@ -52,9 +48,5 @@ contract LocalTestbed {
 
         // 把 owner 移交给部署者（ConfirmedOwner 两步制，需部署者随后 acceptOwnership）
         lottery.transferOwnership(pendingOwner);
-
-        for (uint256 i = 0; i < fundedAccounts.length; i++) {
-            usdc.mint(fundedAccounts[i], 100_000e6);
-        }
     }
 }

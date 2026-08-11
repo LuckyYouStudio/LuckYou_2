@@ -18,11 +18,6 @@
         "internalType": "bytes32"
       },
       {
-        "name": "token",
-        "type": "address",
-        "internalType": "address"
-      },
-      {
         "name": "ticketPrice",
         "type": "uint256",
         "internalType": "uint256"
@@ -182,7 +177,7 @@
       }
     ],
     "outputs": [],
-    "stateMutability": "nonpayable"
+    "stateMutability": "payable"
   },
   {
     "type": "function",
@@ -471,34 +466,16 @@
   },
   {
     "type": "function",
-    "name": "i_token",
-    "inputs": [],
-    "outputs": [
-      {
-        "name": "",
-        "type": "address",
-        "internalType": "contract IERC20"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
     "name": "injectPot",
     "inputs": [
       {
         "name": "roundId",
         "type": "uint32",
         "internalType": "uint32"
-      },
-      {
-        "name": "amount",
-        "type": "uint256",
-        "internalType": "uint256"
       }
     ],
     "outputs": [],
-    "stateMutability": "nonpayable"
+    "stateMutability": "payable"
   },
   {
     "type": "function",
@@ -1367,6 +1344,11 @@
   },
   {
     "type": "error",
+    "name": "IncorrectPayment",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "InvalidQuantity",
     "inputs": []
   },
@@ -1388,11 +1370,6 @@
   {
     "type": "error",
     "name": "InvalidTierConfig",
-    "inputs": []
-  },
-  {
-    "type": "error",
-    "name": "InvalidToken",
     "inputs": []
   },
   {
@@ -1479,17 +1456,6 @@
   },
   {
     "type": "error",
-    "name": "SafeERC20FailedOperation",
-    "inputs": [
-      {
-        "name": "token",
-        "type": "address",
-        "internalType": "address"
-      }
-    ]
-  },
-  {
-    "type": "error",
     "name": "SalesArePaused",
     "inputs": []
   },
@@ -1506,6 +1472,11 @@
   {
     "type": "error",
     "name": "TierNotOpened",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "TransferFailed",
     "inputs": []
   },
   {

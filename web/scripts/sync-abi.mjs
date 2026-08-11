@@ -10,7 +10,6 @@ mkdirSync(dest, { recursive: true });
 
 const artifacts = [
   ["Lottery.sol/Lottery.json", "Lottery.json"],
-  ["MockERC20.sol/MockERC20.json", "MockERC20.json"],
   ["VRFCoordinatorV2_5Mock.sol/VRFCoordinatorV2_5Mock.json", "VRFCoordinatorV2_5Mock.json"],
 ];
 
