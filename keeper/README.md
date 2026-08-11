@@ -34,6 +34,31 @@ powershell -ExecutionPolicy Bypass -File keeper\uninstall-task.ps1   # 卸载
 powershell -ExecutionPolicy Bypass -File keeper\keeper.ps1 -Force
 ```
 
+## 为什么要经 `run-hidden.vbs` 启动（别改回直接跑 powershell）
+
+`powershell.exe` 是**控制台程序**。计划任务在交互会话里启动它时，Windows 会
+**先创建控制台窗口**，`-WindowStyle Hidden` 是在那之后才生效的——于是每分钟闪一次黑框。
+
+更麻烦的是那个窗口会**抢焦点**：按 Win 弹出的开始菜单会被下一次触发关掉，
+用起来就像 Win 键失灵了（2026-08-11 实测踩过，不是理论问题）。
+
+两条解法：
+
+| 方案 | 是否需要管理员 | 本项目采用 |
+|---|---|---|
+| 任务设成 S4U 登录类型（不在交互会话运行） | **需要** | ✗ 注册时 Access denied |
+| 经 `wscript.exe` 启动（GUI 子系统，自身不建控制台） | 不需要 | ✓ |
+
+`run-hidden.vbs` 用 `Run(cmd, 0, True)` 以 `SW_HIDE` 拉起 PowerShell，
+第三个参数 `True` 表示等待结束，好让计划任务的 `MultipleInstances` 与超时设置按预期生效。
+
+**如果哪天又开始闪窗口**，八成是有人把任务的 Execute 改回了 `powershell.exe`。
+核对方法：
+
+```powershell
+(Get-ScheduledTask -TaskName LuckYou-Keeper).Actions[0].Execute   # 应为 wscript.exe
+```
+
 ## 请单独给它一个账户
 
 脚本优先读 `contracts/.env` 里的 `KEEPER_PRIVATE_KEY`，找不到才回退到部署者的

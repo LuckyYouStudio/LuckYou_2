@@ -14,9 +14,17 @@ $script = Join-Path $PSScriptRoot 'keeper.ps1'
 
 if (-not (Test-Path $script)) { throw "找不到 $script" }
 
+# 必须经 wscript.exe 这个隐藏启动器，不能直接 Execute powershell.exe：
+# powershell.exe 是控制台程序，在交互会话里启动时 Windows 会**先**创建控制台窗口，
+# -WindowStyle Hidden 在那之后才生效 —— 结果就是每分钟闪一次黑框，并且抢焦点，
+# 按 Win 弹出的开始菜单会被下一次触发关掉，用起来就像 Win 键失灵（实测踩过）。
+# 另一条正规路是把任务设成 S4U 登录类型，但那需要管理员权限；
+# wscript.exe 属 GUI 子系统、自身不建控制台，无需提权即可做到全程无窗口。
+$launcher = Join-Path $PSScriptRoot 'run-hidden.vbs'
+if (-not (Test-Path $launcher)) { throw "找不到 $launcher" }
 $action = New-ScheduledTaskAction `
-    -Execute 'powershell.exe' `
-    -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$script`"" `
+    -Execute 'wscript.exe' `
+    -Argument "//B //NoLogo `"$launcher`"" `
     -WorkingDirectory $PSScriptRoot
 
 # 立即开始，每 1 分钟重复一次，无限期

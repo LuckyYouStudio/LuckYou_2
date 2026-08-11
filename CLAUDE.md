@@ -98,3 +98,8 @@ pnpm lint
 - Windows PowerShell 5.1 读 `.ps1` 时按系统 ANSI 码页解析，**无 BOM 的 UTF-8
   中文注释会被拆坏**，连带把字符串终止符吃掉、报一堆莫名其妙的语法错误。
   写 `.ps1` 一律存成 **UTF-8 with BOM**
+- Windows 计划任务里**不要直接 Execute `powershell.exe`**：它是控制台程序，
+  交互会话下 Windows 会先建控制台窗口，`-WindowStyle Hidden` 在那之后才生效，
+  结果每次触发闪一次黑框**并抢焦点**（表现为「Win 键失灵」——开始菜单被下次触发关掉）。
+  S4U 登录类型能根治但要管理员权限；无提权的做法是经 `wscript.exe` 启动一个
+  `Run(cmd, 0, True)` 的 .vbs（GUI 子系统，自身不建控制台）
