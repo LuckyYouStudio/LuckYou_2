@@ -15,6 +15,9 @@ web/.next/
 web/out/
 web/tsconfig.tsbuildinfo
 
+# keeper 运行日志
+keeper/*.log
+
 # 系统
 .DS_Store
 Thumbs.db

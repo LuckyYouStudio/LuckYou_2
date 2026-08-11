@@ -95,3 +95,6 @@ pnpm lint
 - VRF 回调有 gas 上限，回调里做循环或转账会静默失败，整期卡在 DRAWING
 - `forge build` 默认会去 binaries.soliditylang.org 下载 solc，网络受限时用
   `--use <本地 solc 路径>`
+- Windows PowerShell 5.1 读 `.ps1` 时按系统 ANSI 码页解析，**无 BOM 的 UTF-8
+  中文注释会被拆坏**，连带把字符串终止符吃掉、报一堆莫名其妙的语法错误。
+  写 `.ps1` 一律存成 **UTF-8 with BOM**
