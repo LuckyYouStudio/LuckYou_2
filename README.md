@@ -80,11 +80,13 @@ forge script script/Deploy.s.sol --rpc-url $BASE_SEPOLIA_RPC_URL \
 
 部署脚本会打印待办清单：到 [vrf.chain.link](https://vrf.chain.link) 给订阅加 consumer 并充 LINK。
 开奖触发（keeper）：Chainlink Automation 已于 2026 年中弃用（替代品为 CRE），
-测试阶段用自托管轮询 keeper——见 [`keeper/`](keeper/README.md)，一条命令装成
-Windows 计划任务，每分钟 `checkUpkeep`，为真则 `performUpkeep`，并对卡在 DRAWING
-超过 3 小时的期自动 `retryDraw`。主网前迁移到 CRE 定时工作流。
-keeper **不在信任边界内**：这两个函数都无权限、任何人可调，keeper 全停也只是
-开奖延迟，不影响资金安全。
+测试阶段**手动兜底开奖**：`keeper/keeper.ps1 -CheckOnly` 只读查询该不该开奖
+（不需要任何密钥），到点则在前端点「🎰 触发开奖」，用自己的钱包签名。
+[`keeper/`](keeper/README.md) 里另有一套可选的 Windows 计划任务做无人值守，
+但默认不安装——无人值守意味着机器上要常驻一把能发交易的钥匙，手动模式一把都不需要。
+正式上线前换成正规服务调用或 CRE 定时工作流。
+keeper **不在信任边界内**：`performUpkeep`/`retryDraw` 都无权限、任何人可调，
+全停也只是开奖延迟，不影响资金安全。
 链上参数（VRF coordinator / keyHash）已按 chainid 写入脚本，
 来源：[Chainlink VRF v2.5 支持网络](https://docs.chain.link/vrf/v2-5/supported-networks)。
 

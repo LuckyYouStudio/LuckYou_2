@@ -1,7 +1,33 @@
 # 自托管 keeper
 
 Chainlink Automation 已于 2026 年中弃用，替代品 CRE 的部署权限还没批下来
-（见 `keeper-cre/`）。这个目录是过渡方案：一个每分钟跑一次的 Windows 计划任务。
+（见 `keeper-cre/`）。这个目录是过渡方案。
+
+## 当前运维模式：手动保底（2026-08-11 起）
+
+**计划任务默认不安装。** 现阶段开奖靠人工兜底，正式上线前再换成正规的服务调用。
+这样机器上不需要常驻任何签名密钥。
+
+日常只有两步：
+
+```powershell
+# 1. 查一眼现在该不该开奖（**只读，不需要任何密钥**）
+powershell -ExecutionPolicy Bypass -File keeper\keeper.ps1 -CheckOnly
+```
+
+2. 若显示「开奖已到期」，打开测试站点点 **🎰 触发开奖** ——
+   走你自己的钱包签名，机器上不留私钥。任何人都能点，keeper 不在信任边界内。
+
+`-CheckOnly` 同时会报告有没有期卡在 DRAWING 超过 3 小时（那种情况需要有人调
+`retryDraw`，前端也有对应按钮）。
+
+> 为什么不图省事一直挂着计划任务：见下方「请单独给它一个账户」。
+> 无人值守 = 机器上必须常驻一把能发交易的钥匙，而手动模式一把都不需要。
+
+## 想自动化时（可选）
+
+下面这套仍然可用，装之前**先按后文配好 keeper 专用密钥**——脚本是失败关闭的，
+没配密钥会直接拒绝运行，不会退回用你的部署者私钥。
 
 ## 它做两件事
 
@@ -9,6 +35,8 @@ Chainlink Automation 已于 2026 年中弃用，替代品 CRE 的部署权限还
 |---|---|---|
 | 到点开奖 | `checkUpkeep` 返回 true | `performUpkeep` |
 | 卡住兜底 | 有期停在 DRAWING 超过 `DRAW_TIMEOUT`(3h) | `retryDraw` |
+
+带 `-CheckOnly` 时两件都只报告、不发交易，因此不需要签名密钥。
 
 两个都是**无权限函数，任何人可调**。keeper 不在信任边界内——它只是"有人按时来按按钮"，
 按不按都不影响资金安全，最坏是开奖延迟。
@@ -110,11 +138,6 @@ icacls "C:\test\LuckYou_2\keeper" /inheritance:r /grant:r "${env:USERNAME}:(OI)(
 ```
 
 密码文件同理，且**不要**放在这个目录里。
-
-```bash
-# 在 contracts/.env 里加一行（该文件已 gitignore）
-KEEPER_PRIVATE_KEY=0x...   # 一个只放少量测试网 ETH、专用于付 gas 的账户
-```
 
 ## 为什么是每分钟
 

@@ -4,17 +4,20 @@
 #   1. checkUpkeep 为真 → performUpkeep：到点开奖并开出下一期
 #   2. 有期卡在 DRAWING 且超过 DRAW_TIMEOUT(3h) → retryDraw：VRF 掉链子时救回
 #
-# 安全：keeper 不需要任何特权。请在 contracts/.env 里单独放一个
-#       KEEPER_PRIVATE_KEY（低额账户，只用来付 gas）。脚本会优先用它；
-#       找不到才回退到部署者 PRIVATE_KEY，并在日志里持续告警——
-#       因为 cast 只接受 --private-key，密钥会出现在本机进程命令行里，
-#       用部署者密钥意味着一旦本机被入侵，owner 权限一起丢。
+# 安全：keeper 不需要任何特权，因此**失败关闭**——没有 keeper 专用签名密钥就
+#       直接退出，绝不回退到部署者 PRIVATE_KEY。停摆只是开奖延迟（任何人可顶上），
+#       而 owner 私钥泄露不可逆。密钥优先走 foundry keystore
+#       （KEEPER_ACCOUNT + KEEPER_PASSWORD_FILE），密钥不进进程命令行；
+#       退而求其次才用 KEEPER_PRIVATE_KEY。详见 keeper/README.md。
 #
 # 退出码恒为 0：计划任务里失败不该反复弹窗，问题一律记进日志。
 
 # -Force：跳过「每 10 分钟才扫一次卡住的期」的节流，用于手动排查与验证。
 #         正常计划任务不要带这个开关，会白白增加公共 RPC 调用。
-param([switch]$Force)
+# -CheckOnly：**只读**。只报告「现在该不该开奖、有没有期卡住」，不发任何交易，
+#         因此**不需要配置任何签名密钥**。手动保底开奖时先跑这个看一眼，
+#         真要开奖用前端的「🎰 触发开奖」按钮（走你自己的钱包，机器上不留私钥）。
+param([switch]$Force, [switch]$CheckOnly)
 
 $ErrorActionPreference = 'Stop'
 
@@ -85,6 +88,7 @@ try {
     #   实测 cast send 支持 --keystore / --account / --password-file）
     $signArgs = @()
     $acct = $envMap['KEEPER_ACCOUNT']
+    # 只读模式无需签名密钥——这样「查一下该不该开奖」不必先在机器上放钥匙
     $pwFile = $envMap['KEEPER_PASSWORD_FILE']
     $rawPk = $envMap['KEEPER_PRIVATE_KEY']
     if (-not [string]::IsNullOrWhiteSpace($acct) -and -not [string]::IsNullOrWhiteSpace($pwFile)) {
@@ -97,6 +101,9 @@ try {
     elseif (-not [string]::IsNullOrWhiteSpace($rawPk)) {
         $signArgs = @('--private-key', $rawPk)
         Write-Log 'WARN  正在用原始私钥签名，它会出现在本机进程命令行里。建议改用 keystore（见 keeper/README.md）'
+    }
+    elseif ($CheckOnly) {
+        $signArgs = $null # 只读，用不到
     }
     else {
         Write-Log 'ERROR 未配置 keeper 签名密钥。请在 contracts/.env 里设置 KEEPER_ACCOUNT + KEEPER_PASSWORD_FILE（推荐）或 KEEPER_PRIVATE_KEY。**不会回退到部署者 PRIVATE_KEY**：keeper 无需任何特权，停摆只是开奖延迟，而 owner 私钥泄露不可逆'
@@ -121,7 +128,12 @@ try {
         exit 0
     }
 
-    if ($needed -match '(?m)^\s*true\s*$') {
+    $isDue = $needed -match '(?m)^\s*true\s*$'
+    if ($CheckOnly) {
+        if ($isDue) { Write-Log "CHECK 开奖已到期，需要有人触发 -> $lottery" }
+        else { Write-Log 'CHECK 开奖未到期' }
+    }
+    elseif ($isDue) {
         Write-Log "开奖到期，发送 performUpkeep -> $lottery"
         $send = Invoke-Cast (@('send', $lottery, 'performUpkeep(bytes)', '0x',
                 '--rpc-url', $rpc) + $signArgs)
@@ -136,7 +148,7 @@ try {
     }
 
     # ---- 2. 卡住的期兜底重试（每 10 分钟查一次，别把公共 RPC 打满）----
-    if ((-not $Force) -and ((Get-Date).Minute % 10 -ne 0)) { exit 0 }
+    if ((-not $Force) -and (-not $CheckOnly) -and ((Get-Date).Minute % 10 -ne 0)) { exit 0 }
 
     $curRaw = Invoke-Cast @('call', $lottery, 's_currentRound()(uint32)', '--rpc-url', $rpc)
     if ($null -eq $curRaw) { exit 0 }
@@ -167,6 +179,10 @@ try {
         if ($requestedAt -eq 0) { $requestedAt = 0 }
         if (($now - $requestedAt) -lt $timeout) { continue }
 
+        if ($CheckOnly) {
+            Write-Log "CHECK 第 $id 期卡在 DRAWING 超过 3 小时，需要有人调 retryDraw"
+            continue
+        }
         Write-Log "第 $id 期卡在 DRAWING 超过 3 小时，发送 retryDraw"
         $retry = Invoke-Cast (@('send', $lottery, 'retryDraw(uint32)', "$id",
                 '--rpc-url', $rpc) + $signArgs)
