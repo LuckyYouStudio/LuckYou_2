@@ -526,6 +526,11 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     // ===== owner 权限（仅限 FR-C-22 列出的三项）=====
 
     /// @notice 设置运营抽成接收地址
+    /// @dev **treasury 必须能接收原生币**（EOA，或带 receive/fallback 且不会 revert
+    ///      的合约）。这是 2026-08-11 改用原生币后**新增**的约束：ERC20 时代转账到
+    ///      任何地址都能成功，现在收款方拒收会让 withdrawFees 永久 revert、抽成卡死。
+    ///      无法在链上预先验证（只有真转一次才知道），因此由 owner 自行保证；
+    ///      万一配错，改回可收款地址即可解冻，奖池不受影响（抽成与奖池分账，FR-C-20）
     function setTreasury(address treasury) external onlyOwner {
         if (treasury == address(0)) revert InvalidTreasury();
         s_treasury = treasury;
@@ -713,6 +718,13 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     }
 
     /// @notice 某地址在某期持有的票数（测试界面用；正式前端走事件）
+    /// @dev **无分页，成本与该期 Range 条数线性相关**，与 getRanges 不同。
+    ///      实测约 500 gas/条：5 万条 range 时约 25M gas，会超出多数公共 RPC 的
+    ///      eth_call 上限而报错。攻击者用大量单张购买灌 range 即可让此视图失效
+    ///      （灌 5 万条的净成本约为票款的 1%，因为票款本身随中奖回到自己手里）。
+    ///      刻意不改签名加分页：这是测试台便利函数，正式前端应由 TicketsBought
+    ///      事件累加得出。调用方**必须**容忍它 revert，不得让它拖垮整个页面刷新。
+    ///      注意写入路径不受影响——claim 走二分查找，恒为 O(log n)
     function ticketsOwned(uint32 roundId, address account) external view returns (uint256 count) {
         TicketRange[] storage ranges = s_ranges[roundId];
         for (uint256 i = 0; i < ranges.length; i++) {

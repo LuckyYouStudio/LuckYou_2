@@ -42,7 +42,7 @@ interface RoundInfo {
   tier1Carry: bigint;
   randomSeed: bigint;
   vrfRequestId: bigint;
-  myTickets: bigint;
+  myTickets: bigint | null; // null = 该期 range 过多，视图读取超限（见合约 NatSpec）
   myPending: bigint[];
 }
 
@@ -96,7 +96,9 @@ export default function Home() {
   );
   const winnersCache = useRef(new Map<number, { tickets: number[]; owners: Address[]; tiers: number[] }>());
   const [qty, setQty] = useState("10");
-  const [injectAmt, setInjectAmt] = useState("100");
+  // 单位是 ETH，不是美元。改用原生币后 "100" 会变成 100 ETH——
+  // 默认值必须是原生币量级的小额（约 10 张票），否则一次误点就是六位数金额
+  const [injectAmt, setInjectAmt] = useState("0.001");
   const [busy, setBusy] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [wrongChain, setWrongChain] = useState(false);
@@ -141,14 +143,23 @@ export default function Home() {
                 args: [id],
               })) as readonly [bigint, bigint])
             : ([0n, 0n] as const);
-        const myTickets = account
-          ? ((await publicClient.readContract({
+        // ticketsOwned 无分页、成本与该期 range 条数线性相关：任何人花约 0.1 ETH
+        // 灌几万条单张购买就能让它超出 eth_call 上限。它此前是在 refresh 的单一
+        // try 里裸调的，一期被灌票会让**整个面板**停止刷新（含倒计时与领奖提示）。
+        // 单独兜住：读不到就显示未知，其余数据照常更新
+        let myTickets: bigint | null = 0n;
+        if (account) {
+          try {
+            myTickets = (await publicClient.readContract({
               address: addresses.lottery,
               abi: lotteryAbi,
               functionName: "ticketsOwned",
               args: [id, account],
-            })) as bigint)
-          : 0n;
+            })) as bigint;
+          } catch {
+            myTickets = null;
+          }
+        }
         const myPending =
           r[0] === 3 && account
             ? ([
@@ -376,6 +387,8 @@ export default function Home() {
   }, [qty, ticketPrice]);
   // 原生币计价下票款与 gas 出自同一余额：余额恰好等于票款也发不出交易
   const notEnough = cost > 0n && account !== null && balance <= cost;
+  const injectWei = useMemo(() => parseTokenAmount(injectAmt), [injectAmt]);
+  const injectTooBig = injectWei > 0n && account !== null && balance <= injectWei;
 
   const totalPending = claimable.reduce((sum, c) => sum + c.amount, 0n);
 
@@ -470,7 +483,7 @@ export default function Home() {
               </div>
               <div className="row">
                 <span className="k">我的持票</span>
-                <span className="v">{current.myTickets.toString()} 张</span>
+                <span className="v">{current.myTickets === null ? "读取超限" : `${current.myTickets} 张`}</span>
               </div>
               {myRanges.length > 0 && (
                 <div className="row">
@@ -566,23 +579,36 @@ export default function Home() {
             )}
           </div>
           <div style={{ marginTop: 8 }}>
-            <input value={injectAmt} onChange={(e) => setInjectAmt(e.target.value)} placeholder="注资额" />
+            <input
+              value={injectAmt}
+              onChange={(e) => setInjectAmt(e.target.value)}
+              placeholder={`注资额（${TOKEN.symbol}）`}
+            />
             <button
               className="btn"
               disabled={
-                busy !== null || !current || current.state !== 1 || chainNow >= current.closeTime
+                busy !== null ||
+                injectWei === 0n ||
+                injectTooBig ||
+                !current ||
+                current.state !== 1 ||
+                chainNow >= current.closeTime
               }
               onClick={() =>
-                act(`注资 ${injectAmt} ${TOKEN.symbol}`, async () => {
+                act(`注资 ${fmt6(injectWei)}`, async () => {
                   // 用整数解析，避免 18 位精度下 JS Number 超出安全整数范围而失真（审计 Low）
-                  const amt = parseTokenAmount(injectAmt);
-                  if (amt === 0n) throw new Error("注资金额无效");
-                  await write(addresses.lottery, lotteryAbi, "injectPot", [currentId], amt);
+                  if (injectWei === 0n) throw new Error("注资金额无效");
+                  await write(addresses.lottery, lotteryAbi, "injectPot", [currentId], injectWei);
                 })
               }
             >
-              💰 注资奖池
+              {/* 金额必须显示在按钮上：输入框里的 "100" 在原生币语义下是 100 ETH，
+                  不能让用户到钱包弹窗才第一次看见真实数额 */}
+              💰 注资奖池（{injectWei > 0n ? fmt6(injectWei) : "—"}）
             </button>
+            {injectTooBig && (
+              <span style={{ color: "var(--red)", fontSize: 12 }}>注资额超过余额</span>
+            )}
           </div>
         </section>
 
@@ -776,7 +802,7 @@ export default function Home() {
                   <td>{fmt6(r.pot)}</td>
                   <td>{r.tier1Carry > 0n ? fmt6(r.tier1Carry) : "-"}</td>
                   <td>{fmtTs(r.closeTime)}</td>
-                  <td>{r.myTickets.toString()}</td>
+                  <td>{r.myTickets === null ? "—" : r.myTickets.toString()}</td>
                 </tr>
               ))}
             </tbody>

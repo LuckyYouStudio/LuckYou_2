@@ -216,6 +216,12 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
 ### 4.6 权限与暂停
 
 - **FR-C-22** owner 的**业务**权限仅限：设置 treasury、设置 feeBps（≤上限）、暂停售票。
+  - **treasury 必须能接收原生币**（2026-08-11 原生 ETH 改造新增的约束）：EOA，或带
+    `receive`/`fallback` 且不会 revert 的合约。ERC20 时代转账到任何地址都能成功，
+    改用原生币后收款方拒收会让 `withdrawFees` 永久 revert、抽成卡死。
+    链上无法预先验证（只有真转一次才知道），故由 owner 自行保证；配错可改回可收款
+    地址解冻，**奖池不受影响**（抽成与奖池自购票起分账，FR-C-20）
+  - 验收：`test/LotteryNativeEth.t.sol::test_RejectingTreasuryBlocksFeesButNotPrizes`
   另有两类**继承而来、无法封禁**的权限，2026-08-09 安全自查后在此显式披露：
   - `transferOwnership` / `acceptOwnership`（来自 ConfirmedOwner）
   - `setCoordinator`（来自 VRFConsumerBaseV2Plus，非 virtual 无法 override）。
@@ -239,10 +245,11 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
        与开期解耦**（第十轮 #1 修复），所以最坏是该期停在 DRAWING 并 emit
        `DrawRequestFailed`，新期照常开出、彩票继续运转；恢复 consumer 后
        任何人可 `retryDraw` 救回。修复前此路径会让期号永不推进、全部资金永久冻结
-    2. **计价 token 发行方**。Base USDC 是可升级、可暂停、可黑名单的代理。
-       **若合约地址被列入黑名单，买票/领奖/提抽成同时失效，且无救援手段**；
-       若 USDC 暂停超过 90 天，领奖窗口是纯墙钟计时，中奖者会在无法转账期间过期。
-       这不是理论风险，而是无牌照链上彩票面临的现实监管动作面（Q7 合规评估的一部分）
+    2. ~~**计价 token 发行方**~~（2026-08-11 已消除）。此前用 Base USDC——可升级、
+       可暂停、可黑名单的代理，合约地址一旦被拉黑则买票/领奖/提抽成同时失效且无救援。
+       **这正是改用链原生币的直接动因**（FR-C-01）：原生币无发行方，没有任何第三方
+       能冻结转账。代价是票价随行情浮动，已记为接受项。
+       剩余的同类风险只有 treasury 自身拒收（见 FR-C-22），且可由 owner 自救
   - **「只有入口没有出口」的结构性权衡**：资金离开合约仅两条路——中奖者 `claim`
     与运营 `withdrawFees`。FR-C-24 用「管理员偷钱」的风险换取了「极端情况下
     所有人都拿不回钱」的风险。主网前**应当**评估是否加入一条不含自由裁量权的
