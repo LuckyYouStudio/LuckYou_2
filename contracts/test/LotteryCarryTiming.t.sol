@@ -75,8 +75,11 @@ contract LotteryCarryTimingTest is LotteryTestBase {
         _buy(bob, 10);
         _settleRound(2, 8);
         assertEq(lottery.s_pendingTier1(), 0, "buffer consumed");
-        // round3 一等奖 = round3 pot 60% + 上期 carry 44550000000000
-        assertEq(lottery.perWinnerAmount(3, 0), 0, "round3 empty until bought");
+        // R21 审计指出这里原本是**空断言**：断言未结算期的 perWinnerAmount 等于 0，
+        // 而未结算期它恒为 0，等于什么都没验。真正该验的是 carry 确实落进了
+        // round3 的一等奖份额（tier1Carry），下面这句才有意义
+        assertEq(_carryOf(3), 44550000000000, "buffered carry landed in round3 tier-1 share");
+        assertEq(uint8(_stateOf(3)), uint8(Lottery.RoundState.OPEN), "round3 is the fresh round");
     }
 
     /// @dev injectPot 与 rolloverExpired 现在时间语义一致：都不改变已封盘期的奖池

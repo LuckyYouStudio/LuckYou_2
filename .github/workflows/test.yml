@@ -1,0 +1,85 @@
+name: CI
+
+# 这个文件原先在 contracts/.github/workflows/ 下 —— GitHub Actions 只读**仓库根目录**的
+# .github/workflows/，所以它从建库起就一次都没运行过（2026-08-11 R21 审计 D-3 实测确认）。
+# 移到根目录后必须显式指定 working-directory，因为 foundry.toml 在 contracts/ 里。
+
+permissions: {}
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  contracts:
+    name: 合约（fmt / build / test / 覆盖率闸）
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Show Forge version
+        run: forge --version
+
+      - name: Run Forge fmt
+        run: forge fmt --check
+
+      - name: Run Forge build
+        run: forge build --sizes
+
+      - name: Run Forge tests
+        run: forge test -vvv
+
+      # FR-T-01 要求行覆盖 >= 90%。此前只靠人工核对，CI 里没有闸
+      - name: 覆盖率闸（FR-T-01：Lottery.sol 行覆盖 >= 90%）
+        run: |
+          set -euo pipefail
+          forge coverage --no-match-coverage "script|mocks|cre" --report summary | tee /tmp/cov.txt
+          line=$(grep -E '\| src/Lottery\.sol' /tmp/cov.txt | head -1)
+          if [ -z "$line" ]; then
+            echo "::error::覆盖率报告里找不到 src/Lottery.sol"
+            exit 1
+          fi
+          pct=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+%' | head -1 | tr -d '%')
+          echo "Lottery.sol 行覆盖：${pct}%"
+          awk -v p="$pct" 'BEGIN { if (p+0 < 90) { print "::error::行覆盖 " p "% 低于 FR-T-01 要求的 90%"; exit 1 } }'
+
+  web:
+    name: 前端（typecheck / build）
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # CLAUDE.md 要求「改完必跑 typecheck」，但此前没有任何自动化保证
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build

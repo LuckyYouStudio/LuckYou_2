@@ -73,13 +73,33 @@ try {
         exit 0
     }
 
-    $pk = $envMap['KEEPER_PRIVATE_KEY']
-    if ([string]::IsNullOrWhiteSpace($pk)) {
-        $pk = $envMap['PRIVATE_KEY']
-        Write-Log 'WARN  未设置 KEEPER_PRIVATE_KEY，正在使用部署者私钥。keeper 不需要任何特权，请改用独立低额账户'
+    # 签名密钥：**失败关闭**。此处曾经写成「找不到就回退到部署者 PRIVATE_KEY，
+    # 只记一行 WARN 然后继续」——那等于让一个每分钟触发的无人值守桌面任务
+    # 长期经手合约 owner 的私钥（实测跑了 44 次，44 次都在用）。
+    # keeper 一个特权都不需要，停摆只是开奖延迟（任何人都能顶上），
+    # 而 owner 私钥泄露不可逆，还会直接坐实 SPEC Q9 里那条不可恢复的全局冻结。
+    # 所以：宁可停，绝不回退。
+    #
+    # 优先 keystore：密钥加密存盘，**不会出现在进程命令行里**。
+    # （此前 README 声称「cast 只接受 --private-key」——那是错的，
+    #   实测 cast send 支持 --keystore / --account / --password-file）
+    $signArgs = @()
+    $acct = $envMap['KEEPER_ACCOUNT']
+    $pwFile = $envMap['KEEPER_PASSWORD_FILE']
+    $rawPk = $envMap['KEEPER_PRIVATE_KEY']
+    if (-not [string]::IsNullOrWhiteSpace($acct) -and -not [string]::IsNullOrWhiteSpace($pwFile)) {
+        if (-not (Test-Path $pwFile)) {
+            Write-Log "ERROR KEEPER_PASSWORD_FILE 指向的文件不存在：$pwFile"
+            exit 0
+        }
+        $signArgs = @('--account', $acct, '--password-file', $pwFile)
     }
-    if ([string]::IsNullOrWhiteSpace($pk)) {
-        Write-Log 'ERROR contracts/.env 里既没有 KEEPER_PRIVATE_KEY 也没有 PRIVATE_KEY'
+    elseif (-not [string]::IsNullOrWhiteSpace($rawPk)) {
+        $signArgs = @('--private-key', $rawPk)
+        Write-Log 'WARN  正在用原始私钥签名，它会出现在本机进程命令行里。建议改用 keystore（见 keeper/README.md）'
+    }
+    else {
+        Write-Log 'ERROR 未配置 keeper 签名密钥。请在 contracts/.env 里设置 KEEPER_ACCOUNT + KEEPER_PASSWORD_FILE（推荐）或 KEEPER_PRIVATE_KEY。**不会回退到部署者 PRIVATE_KEY**：keeper 无需任何特权，停摆只是开奖延迟，而 owner 私钥泄露不可逆'
         exit 0
     }
 
@@ -103,10 +123,8 @@ try {
 
     if ($needed -match '(?m)^\s*true\s*$') {
         Write-Log "开奖到期，发送 performUpkeep -> $lottery"
-        $send = Invoke-Cast @(
-            'send', $lottery, 'performUpkeep(bytes)', '0x',
-            '--private-key', $pk, '--rpc-url', $rpc
-        )
+        $send = Invoke-Cast (@('send', $lottery, 'performUpkeep(bytes)', '0x',
+                '--rpc-url', $rpc) + $signArgs)
         if ($null -eq $send) {
             # 常见且无害：别人抢先开了、或 RPC 短暂不可用。下一次巡检自然纠正
             Write-Log 'WARN  performUpkeep 失败（可能已被他人触发），下次巡检重试'
@@ -123,7 +141,11 @@ try {
     $curRaw = Invoke-Cast @('call', $lottery, 's_currentRound()(uint32)', '--rpc-url', $rpc)
     if ($null -eq $curRaw) { exit 0 }
     $cur = [uint32]($curRaw -replace '[^\d].*$', '')
-    $now = [int64][double]::Parse((Get-Date -UFormat %s))
+    # 不能用 Get-Date -UFormat %s：PowerShell 5.1 下它返回的是**本地时区**的纪元秒，
+    # 本机（UTC+8）实测比真实 UTC 纪元大 28800 秒。用它算 DRAW_TIMEOUT 会让
+    # UTC 以东的机器每次都判定「已超时」而徒劳重试，UTC 以西的机器则把 3 小时
+    # 兜底拖成 8~11 小时——两种情况都让这条兜底路径静默失效
+    $now = [int64][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $timeout = 3 * 60 * 60 # 合约 DRAW_TIMEOUT
 
     $from = [Math]::Max(1, $cur - 5)
@@ -146,10 +168,8 @@ try {
         if (($now - $requestedAt) -lt $timeout) { continue }
 
         Write-Log "第 $id 期卡在 DRAWING 超过 3 小时，发送 retryDraw"
-        $retry = Invoke-Cast @(
-            'send', $lottery, 'retryDraw(uint32)', "$id",
-            '--private-key', $pk, '--rpc-url', $rpc
-        )
+        $retry = Invoke-Cast (@('send', $lottery, 'retryDraw(uint32)', "$id",
+                '--rpc-url', $rpc) + $signArgs)
         if ($null -eq $retry) { Write-Log "WARN  第 $id 期 retryDraw 失败，下次再试" }
         else { Write-Log "OK    第 $id 期已重新请求随机数" }
     }

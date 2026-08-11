@@ -60,12 +60,19 @@ contract LotteryFieldControlTest is LotteryTestBase {
         lottery.buyTickets{value: PRICE * 8}(8);
     }
 
-    /// @dev #2 核心回归：新期售票窗口不得短于 MIN_SALES_WINDOW，无法被择时压缩
+    /// @dev #2 核心回归：新期售票窗口不得短于 MIN_SALES_WINDOW，无法被择时压缩。
+    ///
+    ///      2026-08-11 R21 审计指出此测试原为**假阳性**：日程是 [2d,3d,2d]，第 1 期用掉
+    ///      2d 那一格后 cursor 指向 3d，真正的下一场次是 closeTime+3d 而非 +2d。
+    ///      原来 warp 到 closeTime+2d-1 其实距真场次还有整整一天，实测拿到 86401 秒窗口
+    ///      （下限的 48 倍）——跳格逻辑从未被触发，把保护整个删掉测试照样绿。
+    ///      现在 warp 到**真场次前 1 秒**，并直接断言「那个近在眼前的场次被跳过了」，
+    ///      这才是 MIN_SALES_WINDOW 要保证的性质。
     function test_SalesWindowCannotBeSnipedShort() public {
         _buy(alice, 10);
-        // keeper 缺席，攻击者卡在「距下一场次仅 1 秒」时触发
-        uint64 nextSlot = _closeTimeOf(1) + 2 days;
-        vm.warp(nextSlot - 1);
+        // 第 1 期用的是 intervals[0]=2d，故其后的真实场次是 closeTime + intervals[1]=3d
+        uint64 imminentSlot = _closeTimeOf(1) + 3 days;
+        vm.warp(imminentSlot - 1); // 距真场次仅 1 秒
 
         WindowSniper sniper = new WindowSniper(lottery);
         vm.deal(address(sniper), address(sniper).balance + (8e14));
@@ -73,6 +80,8 @@ contract LotteryFieldControlTest is LotteryTestBase {
 
         uint32 sniped = lottery.s_currentRound();
         uint64 window = _closeTimeOf(sniped) - uint64(block.timestamp);
+        // 核心：那个 1 秒后就到的场次必须被跳过，否则攻击者就拿到了 1 秒独占窗口
+        assertGt(_closeTimeOf(sniped), imminentSlot, "the imminent slot must have been skipped");
         assertGe(window, lottery.MIN_SALES_WINDOW(), "window must respect the floor");
 
         // 其他人仍有充足时间进场

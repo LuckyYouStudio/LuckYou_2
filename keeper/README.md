@@ -61,12 +61,55 @@ powershell -ExecutionPolicy Bypass -File keeper\keeper.ps1 -Force
 
 ## 请单独给它一个账户
 
-脚本优先读 `contracts/.env` 里的 `KEEPER_PRIVATE_KEY`，找不到才回退到部署者的
-`PRIVATE_KEY`，并**每次都在日志里告警**。
+**脚本是失败关闭的：找不到 keeper 专用密钥就记 ERROR 退出，绝不回退到部署者
+`PRIVATE_KEY`。**
 
-原因：`cast` 只接受 `--private-key`，密钥会出现在本机进程命令行里。keeper 既然
-一个特权都不需要，就不该拿着 owner 的钥匙——否则本机一旦被入侵，连带丢掉
-`setTreasury` / `setFeeBps` / `setSalesPaused` 和合约所有权。
+此前的实现是「找不到就回退、只记一行 WARN 然后继续」——2026-08-11 的 R21 审计
+指出并实测确认：那让一个每分钟触发的无人值守桌面任务连续 44 次经手了合约 owner
+的私钥。keeper 一个特权都不需要（`performUpkeep`/`retryDraw` 任何人可调），
+停摆只是开奖延迟、任何人都能顶上；而 owner 私钥泄露不可逆，还会直接坐实
+SPEC Q9 里那条不可恢复的全局冻结。**宁可停，绝不回退。**
+
+### 推荐：用 keystore，密钥不进进程命令行
+
+（此前这份 README 声称「`cast` 只接受 `--private-key`」——**那是错的**。
+实测 `cast send --help`：`--keystore` / `--account` / `--password-file` 都支持。）
+
+```bash
+# 把 keeper 专用私钥导入 foundry keystore（会提示设置密码）
+cast wallet import luckyou-keeper --interactive
+```
+
+再把密码写进一个只有你能读的文件，**放在仓库外**（别放进 `keeper/`，见下方目录权限），
+然后在 `contracts/.env` 里：
+
+```bash
+KEEPER_ACCOUNT=luckyou-keeper
+KEEPER_PASSWORD_FILE=C:\Users\<你>\.luckyou\keeper.pwd
+```
+
+### 退而求其次：原始私钥
+
+```bash
+KEEPER_PRIVATE_KEY=0x...   # 只放少量测试网 ETH、专用于付 gas 的账户
+```
+
+这条路脚本仍然支持，但每次都会告警——密钥会出现在本机进程命令行里，
+任何本地进程都能看到。
+
+### ⚠️ 目录权限
+
+`keeper/` 继承了 `C:\` 的 ACE，`NT AUTHORITY\Authenticated Users` 有 **Modify**
+权限（`icacls keeper` 可自查）。也就是说这台机器上任何已认证用户都能改写
+`keeper.ps1`，而它每分钟带着签名密钥运行一次。
+
+多用户机器上**必须**收紧：
+
+```powershell
+icacls "C:\test\LuckYou_2\keeper" /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F" /grant:r "SYSTEM:(OI)(CI)F"
+```
+
+密码文件同理，且**不要**放在这个目录里。
 
 ```bash
 # 在 contracts/.env 里加一行（该文件已 gitignore）
