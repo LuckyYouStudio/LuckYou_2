@@ -95,6 +95,7 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     error TransferFailed();
     error IncorrectPayment();
     error OnlySelf();
+    error InvalidRecipient();
 
     // ===== 事件（FR-C-25）=====
 
@@ -122,7 +123,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     event TreasuryUpdated(address indexed treasury);
     event FeeBpsUpdated(uint16 feeBps);
     event SalesPausedUpdated(bool paused);
-    /// @notice carry 超出本期自售额配比的部分被扣留、顺延到后续期（FR-C-27）
+    /// @notice carry 超出本期自售额配比的部分被扣留、顺延到后续期（FR-C-27）。
+    /// @dev **这笔钱同时也会由 `PrizeRolledOver` 报告一次**——本事件只是「为什么被扣留」
+    ///      的附加说明。纯事件重建器若把两者都算作缓冲区流入会重复计数，
+    ///      应只累加 `PrizeRolledOver`（R20 I-1）
     event CarryWithheld(uint32 indexed roundId, uint256 amount);
     /// @notice 构造时一次性广播奖级配置。DrawSettled 只带 seed 与各档金额，
     ///         而 slot→奖级 的映射依赖 winnerCounts；没有这个事件，
@@ -230,13 +234,19 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
             // 一个可正常售票的期（审计第三轮 #2，同时并解旧发现 H）
             if (intervals[i] <= SEAL_GAP + MIN_SALES_WINDOW) revert InvalidSchedule();
         }
+        // 日程全合约无 setter，锚点配错只能重新部署。远古锚点会让 _openNextRound 的
+        // 追赶循环在构造时就跑上百万次：实测 anchor=1 且 interval 取允许的最小值 6301 时
+        // 需要 207.9M gas，必然 OOG。加一道显式闸，让配错失败得清楚（R20 L-4）
+        if (uint256(anchorTime) + 365 days < block.timestamp) revert InvalidSchedule();
         if (tierBps.length == 0 || tierBps.length != tierWinnerCounts.length) {
             revert InvalidTierConfig();
         }
         uint256 bpsSum = 0;
         uint256 slots = 0;
         for (uint256 i = 0; i < tierBps.length; i++) {
-            if (tierWinnerCounts[i] == 0) revert InvalidTierConfig();
+            // 名额为 0 的奖级无意义；比例为 0 的奖级 perWinner 恒为 0 ⇒ 永远判为
+            // 「未开出」⇒ 每期把它那份滚走，却照样占用 16 个 slot 的名额预算（R20 I-2）
+            if (tierWinnerCounts[i] == 0 || tierBps[i] == 0) revert InvalidTierConfig();
             bpsSum += tierBps[i];
             slots += tierWinnerCounts[i];
         }
@@ -457,6 +467,23 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
 
     /// @notice 领取某期某奖级的全部本人奖金（pull 模式，FR-C-17）。暂停售票不影响领奖（FR-C-23）
     function claim(uint32 roundId, uint8 tier) external nonReentrant {
+        _claim(roundId, tier, msg.sender);
+    }
+
+    /// @notice 同 claim，但把奖金付到指定地址。
+    /// @dev 只有中奖票的持有人能调用，钱只能由票主自己指向别处，**不增加任何权限面**。
+    ///      存在的理由（2026-08-11 原生 ETH 改造引入的缺陷）：ERC20 时代转账到任何地址
+    ///      都成功，改用原生币后，没有 `receive`/`fallback` 的合约钱包中奖即等于弃奖——
+    ///      `claim` 恒 revert `TransferFailed`，90 天后奖金被 `rolloverExpired` 扫走。
+    ///      顺带满足「冷钱包持票、想领到热钱包」的正常需求
+    function claimTo(uint32 roundId, uint8 tier, address to) external nonReentrant {
+        if (to == address(0)) revert InvalidRecipient();
+        _claim(roundId, tier, to);
+    }
+
+    /// @dev claim / claimTo 的共用实现：中奖判定恒以 msg.sender 持票为准，
+    ///      `to` 只决定钱付到哪里
+    function _claim(uint32 roundId, uint8 tier, address to) private {
         Round storage r = s_rounds[roundId];
         if (r.state != RoundState.SETTLED) revert RoundNotSettled();
         if (tier >= s_tierBps.length) revert InvalidTier();
@@ -478,8 +505,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         }
         if (total == 0) revert NothingToClaim();
 
+        // 事件里记的是**中奖人**（msg.sender），不是收款地址：
+        // FR-C-25 的事件重建器据此归属奖金，收款地址只是支付细节
         emit PrizeClaimed(roundId, msg.sender, tier, total);
-        _sendValue(msg.sender, total);
+        _sendValue(to, total);
     }
 
     /// @notice 领奖窗口结束后，任何人可把该期未领奖金滚入当前期奖池（FR-C-19）
@@ -883,6 +912,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     }
 
     /// @dev 二分查找 ticketId 所在 Range（FR-C-05）
+    /// @dev **前置条件：该期至少有一条 Range**（即 ticketCount >= 1）。
+    ///      下面的 `ranges.length - 1` 在空数组上会下溢 panic。当前所有调用点都被
+    ///      `state == SETTLED`（蕴含 ticketCount >= 1，因为零票期走 VOIDED）或
+    ///      `ticketId < ticketCount` 挡住，实际不可达；新增视图函数时必须保持这个不变量（R20 I-3）
     function _ownerOfTicket(uint32 roundId, uint32 ticketId) private view returns (address) {
         TicketRange[] storage ranges = s_ranges[roundId];
         uint256 lo = 0;

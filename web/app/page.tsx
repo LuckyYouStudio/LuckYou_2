@@ -28,9 +28,12 @@ const STATE_NAMES = ["未创建", "售票中", "开奖中", "已结算", "已作
 const STATE_TAGS = ["", "open", "drawing", "settled", "voided"] as const;
 const TIER_NAMES = ["一等奖", "二等奖", "三等奖"];
 const HISTORY_LIMIT = 8; // 期次历史表的显示条数
-// 领奖窗口 90 天；按最短场次间隔（快节奏实例 2 小时）反推需回溯的期数上限，
-// 避免中奖者因界面只看最近几期而错失奖金（审计第九轮 C1）
-const CLAIM_SCAN_ROUNDS = 120;
+// 回溯期数的**上限**。第九轮加这道防线是为了「别让中奖者错失奖金」，但当时写死的
+// 120 与它自己的注释矛盾：90 天 ÷ 2 小时 = 1080 期，不是 120（120 期 × 2 小时只有 10 天）。
+// 官方日程（平均 2.33 天/期）下 90 天≈39 期，所以主网从未受影响；受影响的是
+// 快节奏测试实例——中奖者从第 11 天起就再也看不到自己的奖金，而链上窗口还有 80 天。
+// 现在改为按链上实际出期节奏推导（见 scanClaimable），这里只留一个防爆上限（R20 L-2）
+const CLAIM_SCAN_ROUNDS_MAX = 1200;
 
 interface RoundInfo {
   id: number;
@@ -278,7 +281,40 @@ export default function Home() {
       return;
     }
     try {
-      const from = Math.max(1, currentId - CLAIM_SCAN_ROUNDS + 1);
+      // 按链上实测节奏反推需要回溯多少期：只读两期的 closeTime 就能得到平均间隔，
+      // 比写死一个常量可靠——同一份前端要同时服务 2 小时的测试实例和 2.33 天的正式日程
+      let depth = CLAIM_SCAN_ROUNDS_MAX;
+      if (currentId > 1) {
+        try {
+          const [first, last] = (await Promise.all([
+            publicClient.readContract({
+              address: addresses.lottery,
+              abi: lotteryAbi,
+              functionName: "getRound",
+              args: [1],
+            }),
+            publicClient.readContract({
+              address: addresses.lottery,
+              abi: lotteryAbi,
+              functionName: "getRound",
+              args: [currentId],
+            }),
+          ])) as readonly (readonly [number, bigint, bigint, number, bigint, bigint, bigint, number, boolean])[];
+          const span = last[1] - first[1]; // closeTime 之差
+          const avg = span / BigInt(currentId - 1);
+          if (avg > 0n) {
+            const claimWindowSec = 90n * 24n * 3600n;
+            // +2 期余量，覆盖取整与刚结算尚未推进的边界
+            depth = Number(claimWindowSec / avg) + 2;
+          }
+        } catch {
+          // 读不到就退回上限，宁可多扫也不要漏掉中奖者的钱
+        }
+      }
+      if (depth > CLAIM_SCAN_ROUNDS_MAX) depth = CLAIM_SCAN_ROUNDS_MAX;
+      if (depth < 8) depth = 8;
+
+      const from = Math.max(1, currentId - depth + 1);
       const ids: number[] = [];
       for (let id = currentId; id >= from; id--) ids.push(id);
       const results = await Promise.all(

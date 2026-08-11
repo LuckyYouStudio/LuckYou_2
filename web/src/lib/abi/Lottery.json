@@ -266,6 +266,29 @@
   },
   {
     "type": "function",
+    "name": "claimTo",
+    "inputs": [
+      {
+        "name": "roundId",
+        "type": "uint32",
+        "internalType": "uint32"
+      },
+      {
+        "name": "tier",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "to",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "distributableEstimate",
     "inputs": [
       {
@@ -1350,6 +1373,11 @@
   {
     "type": "error",
     "name": "InvalidQuantity",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "InvalidRecipient",
     "inputs": []
   },
   {

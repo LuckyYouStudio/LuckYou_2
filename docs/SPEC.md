@@ -155,6 +155,11 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
 ### 4.5 领奖与资金
 
 - **FR-C-17** **MUST** 采用 pull 模式：中奖者调用 `claim(roundId, tier)` 领取
+  - **MUST** 另提供 `claimTo(roundId, tier, to)`（2026-08-11 增，R20 M-1）：
+    中奖判定恒以 `msg.sender` 持票为准，`to` 只决定钱付到哪里，**不增加任何权限面**。
+    存在的理由是原生 ETH 改造引入的一类弃奖：没有 `receive`/`fallback` 的合约钱包
+    中奖后 `claim` 恒 revert `TransferFailed`，90 天后奖金被 `rolloverExpired` 扫走。
+    `to` **MUST NOT** 为零地址
 - **FR-C-18** `claim` **MUST** 遵循 Checks-Effects-Interactions，且 **MUST** 加
   `ReentrancyGuard`
 - **FR-C-19** 领奖窗口 `CLAIM_WINDOW` = 90 天，**自该期实际结算时刻 `settledAt` 起算**
@@ -200,13 +205,31 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   - 现行配比制使资本门槛与捕获量线性挂钩，且只要有人买票就释放对应额度，
     不会像阶跃门槛那样在低参与度下把资金永久冻结
   - **诚实的局限**：仍不能消除捕获。买光全场即可拿走全部奖池是抽签制彩票的
-    固有性质，攻击者的本金也会随中奖回到自己手里；配比只抬高资本门槛
-    （投 X 至多撬动 X 的 carry）并给其他参与者稀释的机会
+    固有性质，攻击者的本金也会随中奖回到自己手里；配比只抬高**单期**的资本门槛
+    并给其他参与者稀释的机会
+  - ⚠️ **暴露面订正（2026-08-11 R20 H-2）**：此处原写「投 X 至多撬动 X 的 carry」，
+    读起来像是「要吃下 10 ETH 的 carry 就得备齐 10 ETH」——**这是对暴露面的实质性低估**。
+    「X 换 X」只在**单期内**成立。攻击者的本金随中奖立刻回到手里，因此同一笔钱
+    每期复用一次，单期净收益 ≈ 本金（只损耗 1% 抽成）。实测：注资 10 ETH、
+    攻击者本金 1 ETH，单期 1 → 1.98 ETH，按官方日程约 3 周抽干，**资本占用恒为 1 ETH**。
+    真正的暴露面是**整包缓冲区**，而不是单期的 X。
+    - 而且「唯一买家」可以**在链上强制**、零风险：辅助合约在买票前检查
+      `ticketCount == 0`，有人参与就整笔回滚，只白付 gas。既有的最短窗口、
+      按窗口打折、1:1 配比都只限制**单期捕获量**，不限制**重复次数**。
+    - **前提是有效参与度接近零**——任何人买 1 张票就会让那笔交易回滚。所以这不是
+      「攻击一个热闹的彩票」，而是「冷清的彩票 + 一笔大额注资」，恰好就是冷启动场景。
+    - 最有效的缓解是运营纪律而非代码：见 FR-C-26 的「单次注资不超过一期有机售票额」。
+      若要在代码上再压一档，可把 `CARRY_MATCH_MULTIPLIER` 改成 bps 并降到 1 以下，
+      把单期净收益从 ≈100% 压到 ≈50%——**这不能消除策略**，只是把抽干时间拉长一倍，
+      代价是正常参与者拿到的 carry 也一起减半（产品决策，未实施）
   - 验收：注资 10000、仅买 8 张时至多拿回「本金 + 等额 carry」，其余留在缓冲
 
-- **FR-C-26** 冷启动注资（2026-08-07 增）：**MUST** 提供
-  `injectPot(uint32 roundId, uint256 amount)`，任何人可向处于 OPEN 状态的期
-  注入 token，全额计入该期 pot、不抽成，SafeERC20 收款并 emit `PotInjected`。
+- **FR-C-26** 冷启动注资（2026-08-07 增；2026-08-11 随 FR-C-01 改为原生币）：
+  **MUST** 提供 `injectPot(uint32 roundId) payable`，任何人可向处于 OPEN 状态的期
+  注入原生币，`msg.value` 全额计入该期 pot、不抽成，emit `PotInjected`。
+  - **运营纪律（R20 H-2）**：单次注资**不应**远超一期的有机售票额。缓冲区规模一旦
+    远大于自然成交量，「唯一买家」策略就必然有利可图（见 FR-C-27 的暴露面说明）。
+    大额冷启动**应当**拆成多期小额注入，或等有机成交量上来再注
   注入只进不出，**MUST NOT** 存在对应的取回函数（与 FR-C-24 一致）。
   若该期最终 VOIDED（零购票），已注入金额 **MUST** 经滚存缓冲区转出（FR-C-28），
   emit `PrizeRolledOver(roundId, 0, amount)`；其后按窗口完整度打折释放到新期。
@@ -226,8 +249,25 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   - `transferOwnership` / `acceptOwnership`（来自 ConfirmedOwner）
   - `setCoordinator`（来自 VRFConsumerBaseV2Plus，非 virtual 无法 override）。
     合约已把 coordinator 钉死为 immutable：请求恒发往钉死地址，回调强制校验
-    随机源未被替换（`CoordinatorTampered`）。**owner 换源无法操纵开奖或挪用资金**，
-    最坏只能造成可自行恢复的结算延迟
+    随机源未被替换（`CoordinatorTampered`）。**owner 换源无法操纵开奖或挪用资金**。
+    - ⚠️ **但「最坏只是可自行恢复的延迟」这句话是错的**（2026-08-11 R20 H-1/M-2 订正）。
+      `setCoordinator` 的修饰符是 `onlyOwnerOrCoordinator` 而非 `onlyOwner`，
+      因此有两条路径会把 `s_vrfCoordinator` 改掉，且**都不可恢复**：
+      1. **Chainlink 官方订阅迁移**：`VRFCoordinatorV2_5.migrate(subId, newCoordinator)`
+         由**订阅所有者**调用，会遍历全部 consumer 逐个调 `setCoordinator`。
+         迁移后回调恒被判为 `CoordinatorTampered`，而请求仍发往旧 coordinator
+         （那里的 subId 已被删除）——两条腿同时断，每一期都停在 DRAWING，
+         `retryDraw` 也救不回来，**全部奖池永久冻结**。彩票不会报错停摆，
+         它会继续正常售票收钱。`i_coordinator` 是 immutable，没有任何重新钉死的办法。
+         这不是理论风险：本项目自己就因 Automation 被官方弃用而被迫迁移到 CRE（Q8），
+         VRF v2.5 将来同样会有下一代 coordinator。
+      2. **owner 私钥丢失或被盗**：攻击者调一次 `setCoordinator(任意地址)` 即可造成
+         同样的永久冻结。偷不到钱，但对用户而言「钱永远出不来」与被偷差别不大。
+    - **当前的缓解（纪律层，不解决根因）**：
+      - VRF 订阅所有者 **MUST** 使用多签，并**绝不可**调用 `migrate`
+      - 订阅所有者与彩票 owner **应当**是不同主体
+      - owner **MUST** 使用多签
+    - **根因修复是未决项，见第 9 节 Q9**
   - 验收：`test/LotteryVrfHijack.t.sol` 证明劫持随机源后回调被拒、奖池分文未动
 - **FR-C-23** `setSalesPaused(true)` **MUST** 只影响 `buyTickets`。
   `claim` / `rolloverExpired` / `retryDraw` **MUST** 不受影响
@@ -281,12 +321,16 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
 - **FR-T-02** **MUST** 包含以下 fuzz 测试：
   - 中奖者永远是本期真实持票人
   - 任意 ticketId 二分查找结果 == 线性扫描结果
-  - 两种 decimals 的 token 下账目一致
+  - 不同票价量级（1e14 / 1e18 wei）下账目一致
 - **FR-T-03** **MUST** 包含 Foundry 不变量测试（`invariant_`），至少覆盖：
-  - `合约 token 余额 >= 所有未领奖金 + accruedFees`
+  - `合约原生币余额 >= 所有未领奖金 + accruedFees + 滚存缓冲区`（实现收紧为恒等式）
   - `sum(各期 pot) + accruedFees + 已支付总额 == 历史购票总额 + 历史注资总额`
 - **FR-T-04** **MUST** 包含以下攻击场景测试：
-  - 重入 `claim`（用恶意 ERC20 回调）
+  - 重入 `claim`（中奖者合约在 `receive` 里回调——原生币下**每次派奖都是一次对
+    任意代码的调用**，比 ERC20 时代更危险：ERC20 转账不回调接收方，须构造恶意 token 才能重入）
+  - 跨函数重入：派奖回调里横向调用 `performUpkeep` / `buyTickets` / `withdrawFees` /
+    `rolloverExpired`
+  - 强制打款（`selfdestruct`）不得干扰任何金额计算
   - 旧 VRF 回调覆盖新结果
   - `closeTime` 边界抢跑购票
   - owner 试图把 feeBps 设到上限以上
@@ -300,8 +344,13 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
 技术栈：Next.js (App Router) + TypeScript + wagmi v2 + viem + RainbowKit + Tailwind
 
 - **FR-W-01** 首页 **MUST** 展示：当前期号、当前奖池、倒计时、票价、我的持票数
-- **FR-W-02** 购票流程 **MUST** 正确处理 ERC20 两步：先检查 allowance，
-  不足则先 `approve`，再 `buyTickets`。两笔交易都要有独立的 pending/成功/失败状态
+- **FR-W-02** 购票流程为**一步成交**（2026-08-11 随 FR-C-01 改为原生币，
+  approve 两步流程已不存在）：直接以 `msg.value = 票价 × 张数` 调 `buyTickets`，
+  需有 pending/成功/失败三态。
+  - **MUST** 在按钮上显示即将发送的**实际金额**。原生币下同一个输入串的含义比
+    稳定币时代大 6 个数量级（"100" 从 100 USDC 变成 100 ETH），不得让钱包弹窗
+    成为用户第一次看见数额的地方（2026-08-11 审计 F2，High）
+  - **MUST** 拦截余额不足：票款与 gas 出自同一余额，余额恰等于票款也发不出交易
 - **FR-W-03** **MUST** 有「我的记录」页：从 `TicketsBought` 和 `PrizeClaimed`
   事件读取当前地址的历史，不依赖任何后端
 - **FR-W-04** 若当前地址在某期中奖且未领取且未过期，**MUST** 显著提示并提供
@@ -369,3 +418,26 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   checkUpkeep/performUpkeep 接口不变——keeper 本就不在信任边界内
   （performUpkeep/retryDraw 任何人可调，随机数安全仅依赖 VRF）。
   测试阶段用自托管轮询 keeper 触发开奖；主网前迁移到 CRE 定时工作流
+- **Q9（VRF 换源杠杆的根因修复，2026-08-11 提出，⚠️ 未决）**：
+  见 FR-C-22 的订正说明——`setCoordinator` 的修饰符是 `onlyOwnerOrCoordinator`，
+  官方订阅迁移与 owner 私钥失窃两条路径都能造成**不可恢复的全局冻结**。
+  纪律层缓解（多签、不调 migrate）已写入 FR-C-22，但**不能应对 Chainlink 强制迁移**。
+  三个候选方案，需要拍板：
+  - **A（已执行）** 仅纪律：写进信任方清单 + 订阅所有者用多签。零代码，
+    但把「Chainlink 何时淘汰 v2.5」变成了项目的生存时限
+  - **B（推荐评估）** 把 owner 移交给一个极小的、不可升级的 `LotteryAdmin`，
+    它**只**转发 setTreasury / setFeeBps / setSalesPaused，不含任何通用
+    `execute(address,bytes)`、也不含 `transferOwnership`。此后 `setCoordinator`
+    只剩 coordinator 自己能调（= 只有合法迁移），于是可以让 `_requestRandomWords`
+    改用 `s_vrfCoordinator`（跟随迁移）并去掉 `CoordinatorTampered` 校验。
+    一次解决 H-1 与 M-2，不引入代理、不引入行政提款，符合 FR-C-24 的立意。
+    **代价必须说清**：owner 权限从此永久绑定在那个合约上，`LotteryAdmin` 若有 bug，
+    三项业务权限一起失去（但奖池不受影响——它们本来就动不了奖池）
+  - **C（独立议题）** 兜底逃生通道：`abandonStuckRound(roundId)`——某期在 DRAWING
+    停留超过长阈值（如 30 天）后，任何人可标记为可退款，购票者按「票价 × 张数」
+    pull 式原路取回，carry 退回缓冲。**不含任何自由裁量权**，因此不违反 FR-C-24
+    （该条禁的是「管理员能动到未领奖金」）。还需一条配套的缓冲区逃生规则，
+    否则 `s_pendingPot` / `s_pendingTier1` 在同一场景下仍然出不来。
+    这正是 FR-C-24 自己点出的「主网前应当评估」的那条
+
+  **结论：主网前 MUST 有明确结论。B 与 C 不互斥，C 是对「任何原因导致的卡死」的兜底。**
