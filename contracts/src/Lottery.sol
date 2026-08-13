@@ -38,7 +38,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         OPEN,
         DRAWING,
         SETTLED,
-        VOIDED
+        VOIDED,
+        /// @dev 卡死超 ABANDON_TIMEOUT 后作废、转为按票款退款（FR-C-29）。
+        ///      追加在末尾而非插入中间——枚举取值已被前端与既有部署依赖
+        ABANDONED
     }
 
     /// @dev 一次购买产生的连续票号区间 [start, end)（FR-C-04）
@@ -91,11 +94,14 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     error InvalidSchedule();
     error InvalidTierConfig();
     error NoFeesToWithdraw();
-    error CoordinatorTampered();
     error TransferFailed();
     error IncorrectPayment();
     error OnlySelf();
     error InvalidRecipient();
+    error AbandonTooEarly();
+    error RoundNotAbandoned();
+    error NotRangeOwner();
+    error AlreadyRefunded();
 
     // ===== 事件（FR-C-25）=====
 
@@ -134,6 +140,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     event TierConfigSet(uint16[] tierBps, uint8[] winnerCounts);
     /// @notice VRF 请求失败（订阅问题等）。本期留在 DRAWING 待 retryDraw，不阻塞新期开出
     event DrawRequestFailed(uint32 indexed roundId);
+    /// @notice 某期卡死超阈值被作废，转为退款模式（FR-C-29）。amount 为退回缓冲区的非自售部分
+    event RoundAbandoned(uint32 indexed roundId, uint256 carryReturned);
+    /// @notice 作废期的购票者取回票款
+    event TicketsRefunded(uint32 indexed roundId, address indexed buyer, uint256 amount);
 
     // ===== 常量 =====
 
@@ -161,6 +171,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     uint256 public constant CARRY_MATCH_MULTIPLIER = 1;
     uint64 public constant DRAW_TIMEOUT = 3 hours; // FR-C-14
     uint64 public constant CLAIM_WINDOW = 90 days; // FR-C-19
+    /// @notice 卡死逃生阈值（FR-C-29）：某期停在 DRAWING 超过此时长后，
+    ///         任何人可作废该期，购票者按票款原路取回。
+    ///         **不含任何自由裁量权**，因此不违反 FR-C-24（该条禁的是「管理员能动到未领奖金」）
+    uint64 public constant ABANDON_TIMEOUT = 30 days;
     uint16 public constant BPS_DENOMINATOR = 10000;
     uint16 private constant VRF_CONFIRMATIONS = 3;
     uint32 private constant VRF_CALLBACK_GAS = 1_000_000;
@@ -170,10 +184,13 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     uint256 public immutable i_ticketPrice;
     bytes32 public immutable i_keyHash;
     uint256 public immutable i_subId;
-    /// @dev 构造时钉死的随机源。基类 VRFConsumerBaseV2Plus 暴露了 owner 可调且
-    ///      非 virtual（无法 override）的 setCoordinator——若不钉死，owner 可把随机源
-    ///      换成自控合约、离线挑选种子稳中头奖。请求只发往此地址，回调也只认此地址
-    address private immutable i_coordinator;
+    // 注：此处曾有 `address private immutable i_coordinator`，把随机源钉死以防
+    // owner 用继承来的 setCoordinator 换源挑种子。2026-08-13 按 SPEC Q9 方案 B 移除——
+    // 那道校验同时把 Chainlink **官方订阅迁移**判成篡改（migrate 会替每个 consumer
+    // 调 setCoordinator），迁移后回调恒失败、请求又发往已删订阅的旧源，全部奖池永久冻结。
+    // 换源杠杆改由 LotteryAdmin 从**权限侧**消除：owner 是一个物理上没有能力调
+    // setCoordinator 的极小合约，于是 setCoordinator 只剩 coordinator 自己能调
+    // （= 只有合法迁移），随机源便可安全地跟随 s_vrfCoordinator。
 
     // ===== 存储 =====
 
@@ -200,6 +217,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     // 而是先入缓冲，由 _openNextRound 在开出新期（拥有完整、未封盘售票窗口）时消费
     uint256 public s_pendingPot; // 待并入下一新期 pot（过期滚存，FR-C-19）
     uint256 public s_pendingTier1; // 待并入下一新期一等奖份额（Q1 未开出奖级 carry）
+
+    /// @dev 作废期中已退款的 Range（FR-C-29）。按 range 而非按地址记账：
+    ///      同一地址可能有多条 Range，逐条标记才能既支持分批退款又杜绝重复领取
+    mapping(uint32 roundId => mapping(uint256 rangeIndex => bool)) private s_rangeRefunded;
 
     // ===== 构造 =====
 
@@ -259,7 +280,6 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         i_ticketPrice = ticketPrice;
         i_keyHash = keyHash;
         i_subId = subId;
-        i_coordinator = vrfCoordinator;
         s_treasury = treasury;
         s_feeBps = feeBps;
         s_tierBps = tierBps;
@@ -395,11 +415,9 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         internal
         override
     {
-        // 基类只校验 msg.sender == s_vrfCoordinator，而 s_vrfCoordinator 可被 owner
-        // 用继承来的 setCoordinator 换掉。此处强制随机源必须是构造时钉死的那一个，
-        // 杜绝 owner 换源后离线挑选种子操纵开奖（FR-C-11/22/24 的实际保障）
-        if (address(s_vrfCoordinator) != i_coordinator) revert CoordinatorTampered();
-
+        // 基类已校验 msg.sender == s_vrfCoordinator。此处不再额外校验随机源是否被换过：
+        // 换源能力已由 LotteryAdmin 在权限侧消除（SPEC Q9 方案 B），而保留该校验会把
+        // 官方订阅迁移误判为篡改并导致全部奖池永久冻结
         uint32 roundId = s_requestToRound[requestId];
         if (roundId == 0) return; // 未登记的 requestId（期号从 1 起）
         Round storage r = s_rounds[roundId];
@@ -540,6 +558,76 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         // 封盘期、票已冻结，攻击者可预先卡位为唯一买家从而确定性独占这笔过期奖金
         s_pendingPot += unclaimed;
         emit PrizeRolledOver(roundId, 0, unclaimed); // 进缓冲，去向由 CarryReleased 给出
+    }
+
+    /// @notice 卡死逃生通道（FR-C-29）：某期停在 DRAWING 超过 `ABANDON_TIMEOUT` 后，
+    ///         **任何人**可将其作废，购票者随后用 `refundAbandoned` 按票款原路取回。
+    /// @dev 这是对「任何原因导致的卡死」的兜底——VRF 停摆、LINK 烧光、coordinator 变更、
+    ///      乃至尚未发现的 bug。它是唯一**不依赖我们把失效模式列全**的保护。
+    ///      无权限、无参数选择、金额完全由链上状态决定，因此不构成 FR-C-24 禁止的行政提款。
+    /// @dev 计时锚点是该期**原定开奖时刻**（closeTime + SEAL_GAP），而**不是**
+    ///      `drawRequestedAt`——后者会被 `retryDraw` 刷新，攻击者只需每 3 小时重试一次
+    ///      即可无限推迟作废、把逃生通道锁死
+    function abandonStuckRound(uint32 roundId) external {
+        Round storage r = s_rounds[roundId];
+        if (r.state != RoundState.DRAWING) revert RoundNotDrawing();
+        if (block.timestamp < uint256(r.closeTime) + SEAL_GAP + ABANDON_TIMEOUT) {
+            revert AbandonTooEarly();
+        }
+
+        r.state = RoundState.ABANDONED;
+        // 非本期自售的钱（滚存承接 + 注资）不属于任何购票者，退回缓冲区另行分配；
+        // 剩下的 pot 恰好等于自售净额，留作按 Range 退款的资金池
+        uint256 carryBack = r.carriedPot;
+        uint256 tier1Back = r.tier1Carry;
+        r.pot -= carryBack; // carriedPot <= pot 恒成立
+        r.carriedPot = 0;
+        r.tier1Carry = 0;
+        s_pendingPot += carryBack;
+        s_pendingTier1 += tier1Back;
+
+        emit RoundAbandoned(roundId, carryBack + tier1Back);
+        if (carryBack + tier1Back > 0) {
+            emit PrizeRolledOver(roundId, 0, carryBack + tier1Back);
+        }
+    }
+
+    /// @notice 取回作废期的票款（pull 模式，FR-C-29）。传入自己名下的 Range 序号，
+    ///         可分批取回；序号由 `getRanges` 或 `TicketsBought` 事件得到。
+    /// @dev 退款金额 = 票价 × 张数 − 该期抽成，即**不退那 1%**。抽成在购票那一刻
+    ///      就已按 FR-C-20 与奖池分账、可能早已被 `withdrawFees` 提走，退全款会击穿
+    ///      偿付性。按净额退时，全部 Range 退完恰好等于 `pot`，分文不差。
+    ///      每条 Range 都用与购票时**完全相同的算式**重算，避免批量公式引入取整偏差
+    function refundAbandoned(uint32 roundId, uint256[] calldata rangeIndexes)
+        external
+        nonReentrant
+    {
+        Round storage r = s_rounds[roundId];
+        if (r.state != RoundState.ABANDONED) revert RoundNotAbandoned();
+        TicketRange[] storage ranges = s_ranges[roundId];
+        uint16 feeBps = r.feeBpsAtOpen;
+
+        uint256 total = 0;
+        for (uint256 i = 0; i < rangeIndexes.length; i++) {
+            uint256 idx = rangeIndexes[i];
+            if (idx >= ranges.length) revert TicketOutOfRange();
+            TicketRange storage rg = ranges[idx];
+            if (rg.owner != msg.sender) revert NotRangeOwner();
+            if (s_rangeRefunded[roundId][idx]) revert AlreadyRefunded();
+            s_rangeRefunded[roundId][idx] = true;
+            uint256 cost = i_ticketPrice * (rg.end - rg.start);
+            total += cost - (cost * feeBps) / BPS_DENOMINATOR;
+        }
+        if (total == 0) revert NothingToClaim();
+
+        r.pot -= total;
+        emit TicketsRefunded(roundId, msg.sender, total);
+        _sendValue(msg.sender, total);
+    }
+
+    /// @notice 某条 Range 是否已退款（作废期用）
+    function rangeRefunded(uint32 roundId, uint256 rangeIndex) external view returns (bool) {
+        return s_rangeRefunded[roundId][rangeIndex];
     }
 
     /// @notice 把已分账的运营抽成全额转给 treasury。任何人可触发，资金只会去 treasury
@@ -876,9 +964,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         return _requestRandomWords();
     }
 
-    /// @dev 请求恒发往构造时钉死的 coordinator，不受 setCoordinator 影响
+    /// @dev 请求发往当前随机源。跟随 s_vrfCoordinator 是**刻意的**：官方迁移后
+    ///      订阅只存在于新 coordinator 上，钉死旧地址会让请求永远失败（SPEC Q9）
     function _requestRandomWords() private returns (uint256 requestId) {
-        return IVRFCoordinatorV2Plus(i_coordinator)
+        return IVRFCoordinatorV2Plus(address(s_vrfCoordinator))
             .requestRandomWords(
                 VRFV2PlusClient.RandomWordsRequest({
                 keyHash: i_keyHash,

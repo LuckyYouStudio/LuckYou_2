@@ -59,12 +59,16 @@ contract AuditR20PocTest is LotteryTestBase {
     //   ① 在旧 coordinator 上 _deleteSubscription(subId)
     //   ② 以 coordinator 自己的身份对每个 consumer 调 setCoordinator(newCoordinator)
     //      （基类的 onlyOwnerOrCoordinator 允许 coordinator 调用）
-    // 本合约把 coordinator 钉死为 immutable 以防 owner 换源操纵开奖（第一轮 Critical），
-    // 但同一处防线把**合法迁移**也判成篡改：回调恒 revert CoordinatorTampered，
-    // 请求恒发往订阅已被删除的旧 coordinator。
+    // 本合约曾把 coordinator 钉死为 immutable 以防 owner 换源操纵开奖（第一轮 Critical），
+    // 但同一处防线把**合法迁移**也判成篡改：回调恒 revert，请求恒发往已删订阅的旧源。
+    //
+    // 【2026-08-13 已修复，SPEC Q9 方案 B】钉死已移除、随机源改为跟随 s_vrfCoordinator；
+    // 换源杠杆改由 LotteryAdmin 从**权限侧**消除（owner 是一个物理上无法调
+    // setCoordinator 的极小合约）。下面两个 PoC 的断言**已按修复后的语义反转**——
+    // 这正是 R20 报告要求的「修复后需反转断言」，不是为了让测试变绿而改断言。
 
-    /// @dev 迁移后，已在 DRAWING 的期永远无法结算：真回调被拒、retryDraw 也救不回来
-    function test_Poc_H1_MigrationFreezesInFlightRound() public {
+    /// @dev 【已反转】迁移后，已在 DRAWING 的期**能够正常结算**：真回调被接受
+    function test_Poc_H1_MigrationNoLongerFreezesInFlightRound() public {
         _buy(alice, 100);
         assertEq(address(lottery).balance, 100 * PRICE);
 
@@ -75,44 +79,63 @@ contract AuditR20PocTest is LotteryTestBase {
 
         address newCoordinator = _simulateSubscriptionMigration();
 
-        // 真·新 coordinator 的回调被自家的防篡改闸拒绝
+        // 迁移后，新 coordinator 的回调被正常接受（此前会 revert CoordinatorTampered）
         uint256[] memory words = new uint256[](1);
         words[0] = 42;
         vm.prank(newCoordinator);
-        vm.expectRevert(Lottery.CoordinatorTampered.selector);
         lottery.rawFulfillRandomWords(requestId, words);
 
-        // retryDraw 也救不回来：请求恒发往旧 coordinator，那里已无此 consumer
-        vm.warp(block.timestamp + DRAW_TIMEOUT_PLUS);
-        vm.expectRevert();
-        lottery.retryDraw(1);
+        // 该期正常结算，奖金可领——迁移不再意味着资金冻结
+        assertEq(uint8(_stateOf(1)), uint8(Lottery.RoundState.SETTLED), "settled across migration");
+        assertGt(lottery.perWinnerAmount(1, 0), 0, "tier0 opened");
 
-        // 该期永久停在 DRAWING，100 张票的钱一分也出不来
-        assertEq(uint8(_stateOf(1)), uint8(Lottery.RoundState.DRAWING));
-        assertEq(lottery.perWinnerAmount(1, 0), 0);
-        vm.expectRevert(Lottery.RoundNotSettled.selector);
+        (, address[] memory winners,) = lottery.winnersOf(1);
+        uint256 before = winners[0].balance;
+        vm.prank(winners[0]);
         lottery.claim(1, 0);
-        assertEq(address(lottery).balance, 100 * PRICE, "funds are stuck in the contract");
+        assertGt(winners[0].balance, before, "prize actually paid out after migration");
     }
 
-    /// @dev 更糟的是彩票并不停摆：新期照常开出、照常收钱，但一期也结算不了
-    function test_Poc_H1_MigratedLotteryKeepsTakingMoneyAndNeverSettles() public {
+    /// @dev 【已反转】最坏情况下资金也不再被永久困住。
+    ///      本测试里的「新随机源」是个无代码的测试替身，因此迁移后请求依然发不出去、
+    ///      期仍会停在 DRAWING —— 这是刻意保留的最坏情形。修复前它意味着**永久冻结**
+    ///      （FR-C-24 禁止任何取回路径）；现在有了 FR-C-29 的逃生通道，
+    ///      30 天后任何人可作废该期，购票者按票款原路取回。
+    ///      这正是 SPEC Q9 方案 C 的意义：它兜的是**任何原因**导致的卡死，
+    ///      不依赖我们把失效模式列全
+    function test_Poc_H1_StuckRoundsAreNoLongerPermanentlyFrozen() public {
         _simulateSubscriptionMigration();
 
-        for (uint32 id = 1; id <= 3; id++) {
-            _buy(bob, 10);
-            vm.warp(_drawTimeOf(id));
-            lottery.performUpkeep("");
-            assertEq(uint8(_stateOf(id)), uint8(Lottery.RoundState.DRAWING));
-            (uint256 reqId,) = lottery.vrfRequestOf(id);
-            assertEq(reqId, 0, "VRF request must have failed");
-        }
-        assertEq(lottery.s_currentRound(), 4, "rounds keep opening and keep taking money");
+        _buy(bob, 10);
+        vm.warp(_drawTimeOf(1));
+        lottery.performUpkeep("");
+        assertEq(uint8(_stateOf(1)), uint8(Lottery.RoundState.DRAWING));
+        (uint256 reqId,) = lottery.vrfRequestOf(1);
+        assertEq(reqId, 0, "worst case retained: request could not be made");
 
-        // 抽成仍可提走（与奖池分账，FR-C-20），但 99% 的票款是奖池：
-        // claim 需要 SETTLED，而这些期永远到不了 SETTLED，且 FR-C-24 禁止任何取回路径
-        assertEq(address(lottery).balance, 30 * PRICE);
-        assertEq(30 * PRICE - lottery.s_accruedFees(), (30 * PRICE * 9900) / 10000);
+        // 30 天之内不得作废，防止有人拿它当提前退出的工具
+        vm.expectRevert(Lottery.AbandonTooEarly.selector);
+        lottery.abandonStuckRound(1);
+
+        // 30 天后，任何人（这里用一个与本期毫无关系的地址）都可以作废
+        vm.warp(_closeTimeOf(1) + lottery.SEAL_GAP() + lottery.ABANDON_TIMEOUT());
+        vm.prank(carol);
+        lottery.abandonStuckRound(1);
+        assertEq(uint8(_stateOf(1)), uint8(Lottery.RoundState.ABANDONED));
+
+        // 购票者取回票款：票价 × 张数 − 该期抽成（1% 已在购票时分账，不退）
+        uint256[] memory idx = new uint256[](1);
+        idx[0] = 0;
+        uint256 before = bob.balance;
+        vm.prank(bob);
+        lottery.refundAbandoned(1, idx);
+        uint256 expected = 10 * PRICE - (10 * PRICE * FEE_BPS) / 10000;
+        assertEq(bob.balance - before, expected, "refunded exactly the net ticket cost");
+
+        // 退完之后该期账面归零，合约里只剩抽成——没有任何钱被困住
+        (,,,, uint256 potAfter,,,,) = lottery.getRound(1);
+        assertEq(potAfter, 0, "nothing left trapped in the abandoned round");
+        assertEq(address(lottery).balance, lottery.s_accruedFees(), "only fees remain");
     }
 
     // ===== M-1：不能接收原生币的合约钱包，中奖后奖金永久领不出来 =====

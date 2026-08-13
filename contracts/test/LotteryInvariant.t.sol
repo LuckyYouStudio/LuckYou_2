@@ -13,18 +13,28 @@ contract LotteryHandler is Test {
     Lottery public immutable lottery;
     VRFCoordinatorV2_5Mock public immutable coordinator;
     address public immutable treasury;
+    uint256 public immutable subId;
 
     address[3] public actors;
     uint256 public totalBought;
     uint256 public totalInjected;
     uint256 public totalPrizesPaid;
     uint256 public totalFeesWithdrawn;
+    uint256 public totalRefunded;
+    uint256 public abandonOk;
+    uint256 public abandonTried;
     uint32[] internal drawingRounds;
 
-    constructor(Lottery lottery_, VRFCoordinatorV2_5Mock coordinator_, address treasury_) {
+    constructor(
+        Lottery lottery_,
+        VRFCoordinatorV2_5Mock coordinator_,
+        address treasury_,
+        uint256 subId_
+    ) {
         lottery = lottery_;
         coordinator = coordinator_;
         treasury = treasury_;
+        subId = subId_;
         actors[0] = makeAddr("actor0");
         actors[1] = makeAddr("actor1");
         actors[2] = makeAddr("actor2");
@@ -78,7 +88,12 @@ contract LotteryHandler is Test {
             vm.warp(drawTime);
         }
         lottery.performUpkeep("");
-        if (drawingRounds.length < 32) drawingRounds.push(cur);
+        // 零购票期会被直接 VOID，不该记进「待履约」列表——否则 fulfillPending 与
+        // abandon 会把配额浪费在永远不可能命中的期上
+        (Lottery.RoundState after_,,,,,,,,) = lottery.getRound(cur);
+        if (after_ == Lottery.RoundState.DRAWING && drawingRounds.length < 32) {
+            drawingRounds.push(cur);
+        }
     }
 
     /// @dev 履约某个仍在 DRAWING 的期（可乱序，覆盖多请求并存的记账）
@@ -124,6 +139,84 @@ contract LotteryHandler is Test {
     function togglePause(bool paused) external {
         vm.prank(lottery.owner());
         try lottery.setSalesPaused(paused) {} catch {}
+    }
+
+    /// @dev 确定性地造一个「真的卡死」的期，供 FR-C-29 的逃生通道使用。
+    ///
+    ///      为什么必须是组合动作：靠随机 handler 自然凑出「买票 → VRF 故障 → 开奖 →
+    ///      过 30 天 → 作废 → 退款」这 6 步有序动作，在 fuzz 里概率低到不可达。
+    ///      实测探针数据：单独的 abandon/refund handler 跑完整轮后成功次数**恒为 0**，
+    ///      也就是说 ABANDONED 状态的记账从未被守恒检查覆盖过——
+    ///      而那正是一个**持有资金**的新状态，不覆盖等于白加。
+    ///      关键在于开奖那一刻 VRF 必须是坏的：否则 fulfillPending 会把它结算掉，
+    ///      期就不再是 DRAWING，也就永远等不到可作废的时刻
+    function createStuckRound(uint32 qty) external {
+        uint32 cur = lottery.s_currentRound();
+        (Lottery.RoundState st, uint64 closeTime, uint64 drawTime,,,,,,) = lottery.getRound(cur);
+        if (
+            st != Lottery.RoundState.OPEN || block.timestamp >= closeTime
+                || !lottery.salesOpenFor(cur)
+        ) {
+            return;
+        }
+        qty = uint32(bound(qty, 1, 50));
+        uint256 cost = uint256(qty) * 1e14;
+        address actor = actors[0];
+        vm.deal(actor, actor.balance + cost);
+        vm.prank(actor);
+        lottery.buyTickets{value: cost}(qty);
+        totalBought += cost;
+
+        // 让 VRF 请求失败 → 该期停在 DRAWING 且 requestId 为 0，fulfillPending 救不了它
+        try coordinator.removeConsumer(subId, address(lottery)) {} catch {}
+        vm.warp(drawTime);
+        lottery.performUpkeep("");
+        try coordinator.addConsumer(subId, address(lottery)) {} catch {}
+
+        (Lottery.RoundState after_,,,,,,,,) = lottery.getRound(cur);
+        if (after_ == Lottery.RoundState.DRAWING && drawingRounds.length < 32) {
+            drawingRounds.push(cur);
+        }
+    }
+
+    /// @dev 覆盖 FR-C-29 逃生通道：卡死超 30 天的期可被任何人作废。
+    ///      不加这两个 handler，新增的 ABANDONED 状态就是不变量测试里的死代码，
+    ///      其记账错误不会被守恒检查发现（第 21 轮审计正是抓到过这类死路径）
+    function abandon(uint256 pick) external {
+        if (drawingRounds.length == 0) return;
+        uint32 roundId = drawingRounds[bound(pick, 0, drawingRounds.length - 1)];
+        (Lottery.RoundState st, uint64 closeTime,,,,,,,) = lottery.getRound(roundId);
+        if (st != Lottery.RoundState.DRAWING) return;
+        // 主动推进到可作废时刻。靠 skipTime 自然攒满 30 天在 fuzz 里不可达
+        // （实测：默认深度下作废成功次数恒为 0；把 skipTime 上界放大到 40 天反而更糟，
+        //  时间会跳过整个售票窗口，导致每期都零票作废）。handler 本就是测试驱动，
+        //  这里推进时间不影响被检验的对象——记账正确性
+        uint256 t = uint256(closeTime) + lottery.SEAL_GAP() + lottery.ABANDON_TIMEOUT();
+        if (block.timestamp < t) vm.warp(t);
+        abandonTried++;
+        try lottery.abandonStuckRound(roundId) {
+            abandonOk++;
+        } catch {}
+    }
+
+    function refund(uint256 pick, uint256 rangeSeed) external {
+        uint32 cur = lottery.s_currentRound();
+        uint32 roundId = uint32(bound(pick, 1, cur));
+        (Lottery.RoundState st,,,,,,,,) = lottery.getRound(roundId);
+        if (st != Lottery.RoundState.ABANDONED) return;
+        uint256 n = lottery.rangeCountOf(roundId);
+        if (n == 0) return;
+        uint256 idx = bound(rangeSeed, 0, n - 1);
+        Lottery.TicketRange[] memory page = lottery.getRanges(roundId, idx, 1);
+        if (page.length == 0) return;
+        uint256[] memory idxs = new uint256[](1);
+        idxs[0] = idx;
+        address who = page[0].owner;
+        uint256 before = who.balance;
+        vm.prank(who);
+        try lottery.refundAbandoned(roundId, idxs) {
+            totalRefunded += who.balance - before;
+        } catch {}
     }
 
     /// @dev 覆盖 VRF 重试路径（审计第二轮 B）：超时后追加请求，
@@ -178,7 +271,7 @@ contract LotteryInvariantTest is Test {
         );
         coordinator.addConsumer(subId, address(lottery));
 
-        handler = new LotteryHandler(lottery, coordinator, treasury);
+        handler = new LotteryHandler(lottery, coordinator, treasury, subId);
         targetContract(address(handler));
     }
 
@@ -210,6 +303,9 @@ contract LotteryInvariantTest is Test {
                 obligations += pot + carry;
             } else if (st == Lottery.RoundState.SETTLED) {
                 obligations += _unclaimedOf(id);
+            } else if (st == Lottery.RoundState.ABANDONED) {
+                // 作废期的 pot 是「尚未被购票者取回的票款」，仍是应付义务（FR-C-29）
+                obligations += pot;
             }
             // VOIDED 期的资金已全额转移到下期，贡献为 0
         }
@@ -222,7 +318,8 @@ contract LotteryInvariantTest is Test {
     function invariant_Conservation() public view {
         assertEq(
             handler.totalBought() + handler.totalInjected(),
-            address(lottery).balance + handler.totalPrizesPaid() + handler.totalFeesWithdrawn(),
+            address(lottery).balance + handler.totalPrizesPaid() + handler.totalFeesWithdrawn()
+                + handler.totalRefunded(),
             "conservation violated"
         );
     }
@@ -233,5 +330,24 @@ contract LotteryInvariantTest is Test {
         assertLe(
             feesEver, (handler.totalBought() * lottery.MAX_FEE_BPS()) / 10000, "fees exceed cap"
         );
+    }
+
+    /// @dev **确定性**覆盖 ABANDONED 分支的偿付性记账。
+    ///
+    ///      为什么不靠 fuzz：要凑齐「买票 → VRF 故障 → 开奖 → 过 30 天 → 作废 → 退款」
+    ///      这 6 步有序动作，在随机 handler 里概率极低——实测探针显示成功次数长期为 0。
+    ///      ABANDONED 是一个**持有资金**的新状态，它的记账必须被守恒检查真正走到，
+    ///      而不是「handler 里有这个函数」就算数（第 21 轮审计抓到过这类假覆盖）。
+    ///      这里手工驱动一遍，再调用同一条偿付性断言。
+    function test_SolvencyHoldsAcrossAbandonAndRefund() public {
+        handler.createStuckRound(20);
+        invariant_SolvencyExact();
+
+        handler.abandon(0);
+        invariant_SolvencyExact(); // 作废后：pot 变成「待退款」，carry 已回缓冲
+
+        handler.refund(1, 0);
+        invariant_SolvencyExact(); // 部分退款后仍然精确成立
+        assertGt(handler.totalRefunded(), 0, "the refund path must actually execute");
     }
 }

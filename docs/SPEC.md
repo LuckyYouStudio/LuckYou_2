@@ -248,8 +248,15 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   另有两类**继承而来、无法封禁**的权限，2026-08-09 安全自查后在此显式披露：
   - `transferOwnership` / `acceptOwnership`（来自 ConfirmedOwner）
   - `setCoordinator`（来自 VRFConsumerBaseV2Plus，非 virtual 无法 override）。
-    合约已把 coordinator 钉死为 immutable：请求恒发往钉死地址，回调强制校验
-    随机源未被替换（`CoordinatorTampered`）。**owner 换源无法操纵开奖或挪用资金**。
+    **2026-08-13（Q9 方案 B 落地）**：钉死方案已废止，随机源改为跟随
+    `s_vrfCoordinator`（官方迁移可正常跟随）；换源杠杆改从**权限侧**消除——
+    Lottery 的 owner **MUST** 是 `LotteryAdmin`，一个在字节码层面就没有能力发出
+    `setCoordinator` 调用的极小合约（无通用 execute、不转发 Lottery 的 transferOwnership）。
+    于是 `onlyOwnerOrCoordinator` 的两个分支只剩「合法迁移」一条路。
+    - ⚠️ **保护来自部署事实而非合约内校验**：若 owner 仍是 EOA，换源攻击依然成立。
+      部署清单 **MUST** 包含移交所有权这一步，且 **MUST** 在部署后回读 `owner()` 确认。
+      验收：`test/LotteryVrfHijack.t.sol` 同时覆盖「admin 持有时攻击不成立」与
+      「EOA 持有时攻击成立」两个方向
     - ⚠️ **但「最坏只是可自行恢复的延迟」这句话是错的**（2026-08-11 R20 H-1/M-2 订正）。
       `setCoordinator` 的修饰符是 `onlyOwnerOrCoordinator` 而非 `onlyOwner`，
       因此有两条路径会把 `s_vrfCoordinator` 改掉，且**都不可恢复**：
@@ -290,10 +297,26 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
        **这正是改用链原生币的直接动因**（FR-C-01）：原生币无发行方，没有任何第三方
        能冻结转账。代价是票价随行情浮动，已记为接受项。
        剩余的同类风险只有 treasury 自身拒收（见 FR-C-22），且可由 owner 自救
-  - **「只有入口没有出口」的结构性权衡**：资金离开合约仅两条路——中奖者 `claim`
-    与运营 `withdrawFees`。FR-C-24 用「管理员偷钱」的风险换取了「极端情况下
-    所有人都拿不回钱」的风险。主网前**应当**评估是否加入一条不含自由裁量权的
-    逃生通道（如「长期无法开奖后任何人可作废并按购票额原路退款」）
+  - **「只有入口没有出口」的结构性权衡**：资金离开合约原本仅两条路——中奖者 `claim`
+    与运营 `withdrawFees`。**2026-08-13 已按 Q9 方案 C 增加第三条：FR-C-29 的
+    卡死退款通道**，它不含任何自由裁量权（无权限、无参数选择、金额完全由链上状态决定），
+    因此不违反本条禁令（本条禁的是「管理员能动到未领奖金」）
+
+- **FR-C-29** 卡死逃生通道（2026-08-13 增，Q9 方案 C）：某期停在 DRAWING 超过
+  `ABANDON_TIMEOUT`（30 天）后，**任何人** **MUST** 可调 `abandonStuckRound(roundId)`
+  将其作废；购票者随后用 `refundAbandoned(roundId, rangeIndexes[])` 按 Range 取回票款。
+  - 计时锚点 **MUST** 是该期**原定开奖时刻**（`closeTime + SEAL_GAP`），
+    **MUST NOT** 用 `drawRequestedAt`——后者会被 `retryDraw` 刷新，
+    攻击者每 3 小时重试一次即可无限推迟作废、把逃生通道锁死
+  - 退款金额 **MUST** = `票价 × 张数 − 该期抽成`（即不退那 1%）。抽成在购票时已按
+    FR-C-20 分账、可能早已提走，退全款会击穿偿付性；按净额退时全部 Range 退完
+    恰好等于该期 `pot`，分文不差。每条 Range **MUST** 用与购票时相同的算式重算
+  - 非自售部分（注资 / 滚存承接）**MUST** 退回缓冲区，不属于购票者
+  - **MUST** 按 Range 而非按地址记账已退款状态，以同时支持分批取回与杜绝重复领取
+  - 作废期 **MUST** 惰性化：不可重复作废、不可 `retryDraw`、不可 `claim`
+  - 验收：`test/LotteryAbandon.t.sol`（含 fuzz 证明退款总额恒等于自售净额）；
+    偿付性不变量 **MUST** 把 ABANDONED 期的 `pot` 计入应付义务，且该分支
+    **MUST** 有确定性测试保证被真正走到（fuzz 概率过低，实测长期为 0）
 
 ### 4.7 事件
 
@@ -418,7 +441,7 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   checkUpkeep/performUpkeep 接口不变——keeper 本就不在信任边界内
   （performUpkeep/retryDraw 任何人可调，随机数安全仅依赖 VRF）。
   测试阶段用自托管轮询 keeper 触发开奖；主网前迁移到 CRE 定时工作流
-- **Q9（VRF 换源杠杆的根因修复，2026-08-11 提出，⚠️ 未决）**：
+- **Q9（VRF 换源杠杆的根因修复，2026-08-11 提出；2026-08-13 已决：采纳 B + C）**：
   见 FR-C-22 的订正说明——`setCoordinator` 的修饰符是 `onlyOwnerOrCoordinator`，
   官方订阅迁移与 owner 私钥失窃两条路径都能造成**不可恢复的全局冻结**。
   纪律层缓解（多签、不调 migrate）已写入 FR-C-22，但**不能应对 Chainlink 强制迁移**。
@@ -440,4 +463,9 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
     否则 `s_pendingPot` / `s_pendingTier1` 在同一场景下仍然出不来。
     这正是 FR-C-24 自己点出的「主网前应当评估」的那条
 
-  **结论：主网前 MUST 有明确结论。B 与 C 不互斥，C 是对「任何原因导致的卡死」的兜底。**
+  **已决（2026-08-13）：采纳 B + C。**
+  - B 落地为 `src/LotteryAdmin.sol` + Lottery 移除钉死（见 FR-C-22 订正）
+  - C 落地为 FR-C-29
+  - 选择理由：本项目的核心卖点是 FR-C-24「不存在任何能挪用奖池的管理员函数」，
+    留一个「运营方可暗中赢走头奖」的杠杆与之矛盾——冻结是可见且自伤的，
+    暗中操纵开奖是不可见的偷窃，性质不同。C 则是唯一**不依赖我们把失效模式列全**的保护。
