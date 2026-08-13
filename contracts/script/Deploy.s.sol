@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {Script, console} from "forge-std/Script.sol";
 import {VmSafe} from "forge-std/Vm.sol";
 import {Lottery} from "../src/Lottery.sol";
+import {LotteryAdmin} from "../src/LotteryAdmin.sol";
 
 /// @notice 正式网络部署脚本（FR-D-01）：按 block.chainid 区分 Base Sepolia 与 Base 主网。
 ///
@@ -23,7 +24,7 @@ contract Deploy is Script {
 
     error UnsupportedChain(uint256 chainId);
 
-    function run() external returns (Lottery lottery) {
+    function run() external returns (Lottery lottery, LotteryAdmin admin) {
         NetworkConfig memory cfg = _configFor(block.chainid);
         uint256 subId = vm.envUint("VRF_SUBSCRIPTION_ID");
         address treasury = vm.envAddress("TREASURY_ADDRESS");
@@ -78,7 +79,20 @@ contract Deploy is Script {
             tierBps,
             tierWinners
         );
+
+        // SPEC Q9 方案 B：把所有权交给一个物理上无法调 setCoordinator 的极小合约。
+        // **必须与部署放在同一次广播里**：这道保护来自「owner 是 LotteryAdmin」这个
+        // 部署事实，而非合约内的校验——漏做这一步则保护为零，且一切看起来都正常，
+        // 不会有任何报错提示你。做成原子步骤即可从根上消除这个失败模式
+        address adminOwner = vm.envOr("ADMIN_OWNER_ADDRESS", treasury);
+        admin = new LotteryAdmin(address(lottery), adminOwner);
+        lottery.transferOwnership(address(admin)); // ConfirmedOwner 两步转让的第一步
+        admin.acceptLotteryOwnership(); // 第二步
         vm.stopBroadcast();
+
+        // 部署即断言：若所有权没落到 admin 手里，整笔部署失败，绝不产出一个
+        // 「看起来没问题但毫无保护」的实例
+        require(lottery.owner() == address(admin), "Deploy: ownership handover failed");
 
         // 写前端配置（仅测试网；主网前端配置应人工审核后更新）。
         // 仅在真实广播时写：dry run 也覆写会把前端指向一个从未部署的地址（审计第四轮 D-12）
@@ -87,6 +101,7 @@ contract Deploy is Script {
             vm.serializeUint(json, "chainId", block.chainid);
             vm.serializeUint(json, "startBlock", block.number);
             vm.serializeAddress(json, "lottery", address(lottery));
+            vm.serializeAddress(json, "lotteryAdmin", address(admin));
             vm.serializeAddress(json, "vrfCoordinator", cfg.vrfCoordinator);
             // 不写 subId：FR-D-04 禁止订阅 ID 出现在任何提交的文件里，
             // 而这个 JSON 是要提交的前端配置（前端也不需要它）
@@ -98,11 +113,21 @@ contract Deploy is Script {
         console.log("==============================================");
         console.log(unicode"部署完成：", cfg.name);
         console.log("Lottery:", address(lottery));
+        console.log("LotteryAdmin (owner):", address(admin));
+        console.log(unicode"LotteryAdmin 的持有者:", adminOwner);
         // 直接读实例状态，而非在脚本里重算日程——重算过 MIN_SALES_WINDOW 这一关时
         // 会与合约结论不一致（审计第四轮 D-11）
         (, uint64 firstCloseTime, uint64 firstDrawTime,,,,,,) = lottery.getRound(1);
         console.log(unicode"首期停售时间（unix）:", firstCloseTime);
         console.log(unicode"首期开奖时间（unix）:", firstDrawTime);
+        console.log("==============================================");
+        console.log(
+            unicode"已在本次部署内完成：Lottery 所有权 -> LotteryAdmin（Q9 方案 B）"
+        );
+        console.log(
+            unicode"  三项业务权限今后经 LotteryAdmin 调用；setCoordinator 已无人可调"
+        );
+        console.log(unicode"  主网务必把 ADMIN_OWNER_ADDRESS 设为多签");
         console.log("==============================================");
         console.log(unicode"待办清单（缺一不可，否则无法开奖）：");
         console.log(unicode"  1. 在 https://vrf.chain.link 打开订阅", subId);

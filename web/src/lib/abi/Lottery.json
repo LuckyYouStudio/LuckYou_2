@@ -57,6 +57,19 @@
   },
   {
     "type": "function",
+    "name": "ABANDON_TIMEOUT",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "BPS_DENOMINATOR",
     "inputs": [],
     "outputs": [
@@ -158,6 +171,19 @@
       }
     ],
     "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "abandonStuckRound",
+    "inputs": [
+      {
+        "name": "roundId",
+        "type": "uint32",
+        "internalType": "uint32"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
   },
   {
     "type": "function",
@@ -619,6 +645,30 @@
   },
   {
     "type": "function",
+    "name": "rangeRefunded",
+    "inputs": [
+      {
+        "name": "roundId",
+        "type": "uint32",
+        "internalType": "uint32"
+      },
+      {
+        "name": "rangeIndex",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "rawFulfillRandomWords",
     "inputs": [
       {
@@ -628,6 +678,24 @@
       },
       {
         "name": "randomWords",
+        "type": "uint256[]",
+        "internalType": "uint256[]"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "refundAbandoned",
+    "inputs": [
+      {
+        "name": "roundId",
+        "type": "uint32",
+        "internalType": "uint32"
+      },
+      {
+        "name": "rangeIndexes",
         "type": "uint256[]",
         "internalType": "uint256[]"
       }
@@ -1219,6 +1287,25 @@
   },
   {
     "type": "event",
+    "name": "RoundAbandoned",
+    "inputs": [
+      {
+        "name": "roundId",
+        "type": "uint32",
+        "indexed": true,
+        "internalType": "uint32"
+      },
+      {
+        "name": "carryReturned",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "RoundOpened",
     "inputs": [
       {
@@ -1295,6 +1382,31 @@
   },
   {
     "type": "event",
+    "name": "TicketsRefunded",
+    "inputs": [
+      {
+        "name": "roundId",
+        "type": "uint32",
+        "indexed": true,
+        "internalType": "uint32"
+      },
+      {
+        "name": "buyer",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "TierConfigSet",
     "inputs": [
       {
@@ -1327,6 +1439,16 @@
   },
   {
     "type": "error",
+    "name": "AbandonTooEarly",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "AlreadyRefunded",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "AlreadyRolledOver",
     "inputs": []
   },
@@ -1338,11 +1460,6 @@
   {
     "type": "error",
     "name": "ClaimWindowNotClosed",
-    "inputs": []
-  },
-  {
-    "type": "error",
-    "name": "CoordinatorTampered",
     "inputs": []
   },
   {
@@ -1412,6 +1529,11 @@
   },
   {
     "type": "error",
+    "name": "NotRangeOwner",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "NothingToClaim",
     "inputs": []
   },
@@ -1465,6 +1587,11 @@
   {
     "type": "error",
     "name": "RetryTooEarly",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "RoundNotAbandoned",
     "inputs": []
   },
   {
