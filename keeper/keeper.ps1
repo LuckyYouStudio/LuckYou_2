@@ -86,12 +86,19 @@ try {
     # 优先 keystore：密钥加密存盘，**不会出现在进程命令行里**。
     # （此前 README 声称「cast 只接受 --private-key」——那是错的，
     #   实测 cast send 支持 --keystore / --account / --password-file）
+    # 注意 $signArgs 恒为**数组**，绝不可用 $null：PowerShell 里
+    # @('a','b') + $null 会塞进一个 null 元素，传给 cast 就多出一个空参数
+    # （实测 Count 从 4 变 5）。当前只读分支不发交易所以不可达，但这是个地雷
     $signArgs = @()
     $acct = $envMap['KEEPER_ACCOUNT']
-    # 只读模式无需签名密钥——这样「查一下该不该开奖」不必先在机器上放钥匙
     $pwFile = $envMap['KEEPER_PASSWORD_FILE']
     $rawPk = $envMap['KEEPER_PRIVATE_KEY']
-    if (-not [string]::IsNullOrWhiteSpace($acct) -and -not [string]::IsNullOrWhiteSpace($pwFile)) {
+    # 只读模式最先判定：它一笔交易都不发，因此既不需要密钥，
+    # 也不该打出「正在用原始私钥签名」这种并未发生的告警
+    if ($CheckOnly) {
+        $signArgs = @()
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($acct) -and -not [string]::IsNullOrWhiteSpace($pwFile)) {
         if (-not (Test-Path $pwFile)) {
             Write-Log "ERROR KEEPER_PASSWORD_FILE 指向的文件不存在：$pwFile"
             exit 0
@@ -101,9 +108,6 @@ try {
     elseif (-not [string]::IsNullOrWhiteSpace($rawPk)) {
         $signArgs = @('--private-key', $rawPk)
         Write-Log 'WARN  正在用原始私钥签名，它会出现在本机进程命令行里。建议改用 keystore（见 keeper/README.md）'
-    }
-    elseif ($CheckOnly) {
-        $signArgs = $null # 只读，用不到
     }
     else {
         Write-Log 'ERROR 未配置 keeper 签名密钥。请在 contracts/.env 里设置 KEEPER_ACCOUNT + KEEPER_PASSWORD_FILE（推荐）或 KEEPER_PRIVATE_KEY。**不会回退到部署者 PRIVATE_KEY**：keeper 无需任何特权，停摆只是开奖延迟，而 owner 私钥泄露不可逆'
