@@ -38,7 +38,19 @@ export const addresses = {
   lottery: deployment.lottery as Address,
   vrfCoordinator: deployment.vrfCoordinator as Address,
   treasury: deployment.treasury as Address,
+  // SPEC Q9 方案 B：测试网/主网的 Lottery owner 是 LotteryAdmin，三项业务权限
+  // 必须经它转发；本地 anvil 部署不建 admin，owner 仍是 EOA，故此处可能为空
+  lotteryAdmin: (deployment as { lotteryAdmin?: string }).lotteryAdmin as Address | undefined,
 } as const;
+
+/// LotteryAdmin 的窄 ABI（FR-W-07：地址与 ABI 只从这里出）。
+/// 刻意只列三项业务权限——它本来也只有这些
+export const lotteryAdminAbi = [
+  { type: "function", name: "s_owner", inputs: [], outputs: [{ type: "address" }], stateMutability: "view" },
+  { type: "function", name: "setTreasury", inputs: [{ type: "address" }], outputs: [], stateMutability: "nonpayable" },
+  { type: "function", name: "setFeeBps", inputs: [{ type: "uint16" }], outputs: [], stateMutability: "nonpayable" },
+  { type: "function", name: "setSalesPaused", inputs: [{ type: "bool" }], outputs: [], stateMutability: "nonpayable" },
+] as const satisfies Abi;
 
 export const expectedChainId = deployment.chainId;
 /** 合约部署块：事件扫描的起点（从 0 扫会在公共测试网上产生数千次请求） */

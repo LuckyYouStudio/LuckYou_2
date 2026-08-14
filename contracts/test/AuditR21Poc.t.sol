@@ -148,10 +148,15 @@ contract AuditR21PocTest is LotteryTestBase {
     /// @dev anchorTime 闸**不误伤**合法配置：正式部署脚本取「最近一个已过去的周二 12:00 UTC」，
     ///      距今至多 7 天；即便有人要保留一整年前的历史锚点也照样通过。
     function test_Evidence_AnchorGateDoesNotRejectLegitimateSchedules() public {
+        // 2026-08-14（第 50 轮 A-4）：此处原有第四个用例 `block.timestamp + 30 days`，
+        // 注释写「闸是单向的，只挡过老」。那个假设是错的——未来锚点会让第 1 期的
+        // closeTime 也落在未来，`performUpkeep` 永远不到期、期号永不推进，而实例
+        // 照常收钱。它已被改判为非法配置，反向断言见
+        // `AuditR50Poc.t.sol::test_RevertWhen_AnchorIsInTheFuture`
         uint64[3] memory legit = [
             uint64(block.timestamp - 7 days), // 部署脚本的实际取值范围
             uint64(block.timestamp - 364 days), // 一年内的历史锚点
-            uint64(block.timestamp + 30 days) // 未来锚点（闸是单向的，只挡过老）
+            uint64(block.timestamp) // 边界：锚点 == 当刻（快节奏部署分支的取值）
         ];
         for (uint256 i = 0; i < legit.length; i++) {
             Lottery ok = new Lottery(
@@ -485,10 +490,16 @@ contract AuditR21PocTest is LotteryTestBase {
         assertEq(lottery.s_accruedFees(), feesBefore, "fees untouched after the failed transfer");
         assertEq(address(lottery).balance, _obligations(), "solvency identity holds");
 
-        // 改回可收款地址即可解冻（FR-C-22 声称的自救路径，此处实测确认）
+        // 改回可收款地址即可解冻（FR-C-22 声称的自救路径，此处实测确认）。
+        // 2026-08-14（第 50 轮 A-1）：`withdrawFees` 现在会为当期的开奖奖励留一份，
+        // 因此「全部解冻」的判据从 `feesBefore` 改为 `withdrawableFees()`——
+        // 留下的那一份不是卡住的钱，它会在该期开出时发给触发者
         lottery.setTreasury(treasury);
+        uint256 withdrawable = lottery.withdrawableFees();
+        assertGt(withdrawable, 0);
         lottery.withdrawFees();
-        assertEq(treasury.balance, feesBefore, "fees recovered");
+        assertEq(treasury.balance, withdrawable, "fees recovered");
+        assertEq(lottery.s_accruedFees(), feesBefore - withdrawable, "only the reserve remains");
     }
 
     // =====================================================================

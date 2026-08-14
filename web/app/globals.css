@@ -180,6 +180,12 @@ th {
   color: var(--muted);
 }
 
+/* FR-C-29 的作废期：购票者要在这里取回票款，必须显眼 */
+.tag.abandoned {
+  color: var(--red);
+  border-color: var(--red);
+}
+
 .banner {
   background: #1f6feb22;
   border: 1px solid #1f6feb;

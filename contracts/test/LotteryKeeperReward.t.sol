@@ -144,17 +144,33 @@ contract LotteryKeeperRewardTest is LotteryTestBase {
         assertLe(lottery.keeperRewardOf(bob), PRICE, "never exceeds one ticket price");
     }
 
-    /// @dev 抽成已被提走时不得下溢，只能给到当下还剩的部分
-    function test_RewardClampedToAvailableFees() public {
+    /// @dev 提费不得抹掉本期的开奖奖励（第 50 轮 A-1）。
+    ///
+    ///      这条测试原名 `test_RewardClampedToAvailableFees`，断言的是
+    ///      「运营方先提走抽成 ⇒ 触发者拿 0」，把当时的实现行为当成了正确行为。
+    ///      但 `withdrawFees` **无权限**、约 3 万 gas：那等于给了任何人一个
+    ///      零成本抹平 FR-C-30 的断路器，而 FR-C-30 存在的全部意义正是
+    ///      「运营方缺席时仍有人有理由接手」。运营方例行提费同样会误伤。
+    ///      现在 `withdrawFees` 为当期预留一份，场景仍然照跑，断言反转。
+    ///
+    ///      `_accrueKeeperReward` 里那道「不超过 accruedFees」的夹逼**保留不动**：
+    ///      预留使它在正常运行下不再可达，但它仍是防下溢的最后一道防线。
+    function test_RewardSurvivesAFeeSweep() public {
         _buy(alice, 100);
+        uint256 accrued = lottery.s_accruedFees();
         lottery.withdrawFees(); // 运营方先把抽成提走
-        assertEq(lottery.s_accruedFees(), 0);
+        uint256 reserved = lottery.s_accruedFees();
+        assertGt(reserved, 0, "a reserve must be held back");
+        assertEq(treasury.balance, accrued - reserved);
 
         vm.warp(_drawTimeOf(1));
-        vm.prank(bob);
-        lottery.performUpkeep(""); // 不得 revert
+        uint256 due = lottery.pendingKeeperReward(1);
+        assertGt(due, 0, "the button must still be worth pressing");
 
-        assertEq(lottery.keeperRewardOf(bob), 0, "nothing left to pay from");
+        vm.prank(bob);
+        lottery.performUpkeep("");
+
+        assertEq(lottery.keeperRewardOf(bob), due, "the sweep did not starve the keeper");
         assertEq(uint8(_stateOf(1)), uint8(Lottery.RoundState.DRAWING), "draw still proceeds");
     }
 

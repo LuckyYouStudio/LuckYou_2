@@ -26,6 +26,15 @@
 | 部署日期 | 2026-08-13 |
 | 含有 | 原生 ETH、claimTo、Q9 方案 B（LotteryAdmin）+ C（弃期退款）、FR-C-30 开奖激励 |
 | Basescan | 已验证（Lottery + LotteryAdmin） |
+| ⚠️ 已知缺陷 | **这是第 50 轮审计修复前的字节码**，不含 A-1（提费预留）、A-2（`refundAbandonedTo`）、A-3（`claimKeeperRewardTo`）、A-4（锚点闸）。详见 `audit/AUDIT-2026-08-14-R50.md` |
+
+> **CRE 桥接器 `0x8081f1cB5F5381ed3E5883950fb1925642071bf5` 必须重新部署**
+> （第 50 轮 A-3）：它转调 `performUpkeep` 时 `msg.sender` 是它自己，
+> FR-C-30 的开奖奖励因此记在它名下，而旧版**既无领取路径也无 `receive`**——
+> 每一期最多一张票价的运营抽成会被永久锁死。新版构造器多一个
+> `rewardBeneficiary` 参数，且新桥接器**对当前这个 Lottery 完全兼容**，
+> 单独重部它即可，不必重部 Lottery。重部后记得更新
+> `keeper-cre/luckyou-keeper/config.production.json` 的 `receiverAddress`。
 
 `Lottery` 构造参数：
 

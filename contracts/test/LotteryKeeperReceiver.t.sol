@@ -10,10 +10,11 @@ import {LotteryTestBase} from "./Lottery.t.sol";
 contract LotteryKeeperReceiverTest is LotteryTestBase {
     LotteryKeeperReceiver internal receiver;
     address internal forwarder = makeAddr("forwarder");
+    address internal beneficiary = makeAddr("keeperBeneficiary");
 
     function setUp() public override {
         super.setUp();
-        receiver = new LotteryKeeperReceiver(forwarder, address(lottery));
+        receiver = new LotteryKeeperReceiver(forwarder, address(lottery), beneficiary);
     }
 
     function test_OnReport_TriggersDrawWhenDue() public {

@@ -312,6 +312,19 @@
   },
   {
     "type": "function",
+    "name": "claimKeeperRewardTo",
+    "inputs": [
+      {
+        "name": "to",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "claimTo",
     "inputs": [
       {
@@ -763,6 +776,29 @@
   },
   {
     "type": "function",
+    "name": "refundAbandonedTo",
+    "inputs": [
+      {
+        "name": "roundId",
+        "type": "uint32",
+        "internalType": "uint32"
+      },
+      {
+        "name": "rangeIndexes",
+        "type": "uint256[]",
+        "internalType": "uint256[]"
+      },
+      {
+        "name": "to",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "requestRandomWordsSelf",
     "inputs": [],
     "outputs": [
@@ -1084,6 +1120,19 @@
     "inputs": [],
     "outputs": [],
     "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "withdrawableFees",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
   },
   {
     "type": "event",

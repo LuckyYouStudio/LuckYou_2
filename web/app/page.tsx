@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { Address } from "viem";
+import type { Abi, Address } from "viem";
 import {
   ANVIL_ACCOUNTS,
   IS_LOCAL,
@@ -19,13 +19,17 @@ import {
   expectedChainId,
   injectedWalletFor,
   lotteryAbi,
+  lotteryAdminAbi,
   publicClient,
   vrfAbi,
   walletFor,
 } from "@/lib/contracts";
 
-const STATE_NAMES = ["未创建", "售票中", "开奖中", "已结算", "已作废"] as const;
-const STATE_TAGS = ["", "open", "drawing", "settled", "voided"] as const;
+// 必须与合约的 RoundState 枚举逐位对齐。ABANDONED(5) 是 FR-C-29 随 Q9 方案 C 追加的，
+// 此前这两个数组只到 4，作废期在界面上因此**显示为空白**——而那恰恰是购票者
+// 必须看见并去点「取回票款」的状态（第 50 轮 W-1）
+const STATE_NAMES = ["未创建", "售票中", "开奖中", "已结算", "已作废", "已弃期（可退款）"] as const;
+const STATE_TAGS = ["", "open", "drawing", "settled", "voided", "abandoned"] as const;
 const TIER_NAMES = ["一等奖", "二等奖", "三等奖"];
 const HISTORY_LIMIT = 8; // 期次历史表的显示条数
 // 回溯期数的**上限**。第九轮加这道防线是为了「别让中奖者错失奖金」，但当时写死的
@@ -47,6 +51,13 @@ interface RoundInfo {
   vrfRequestId: bigint;
   myTickets: bigint | null; // null = 该期 range 过多，视图读取超限（见合约 NatSpec）
   myPending: bigint[];
+}
+
+/** FR-C-29：某个作废期里本账户尚未取回的票款 */
+interface RefundInfo {
+  roundId: number;
+  rangeIndexes: number[];
+  amount: bigint;
 }
 
 interface LogEntry {
@@ -94,6 +105,11 @@ export default function Home() {
   // FR-C-30：触发开奖可得的奖励，以及本账户已记账未领取的部分
   const [drawReward, setDrawReward] = useState<bigint>(0n);
   const [myKeeperReward, setMyKeeperReward] = useState<bigint>(0n);
+  // FR-C-29：作废期的待退票款。不展示它等于让购票者没有任何界面出口取回自己的钱
+  const [refunds, setRefunds] = useState<RefundInfo[]>([]);
+  // withdrawFees 会为当期开奖奖励预留一份，裸 s_accruedFees 会虚报可提金额
+  // null = 链上是旧字节码、读不到（区别于「确实可提 0」）
+  const [withdrawable, setWithdrawable] = useState<bigint | null>(0n);
   const [salesOpen, setSalesOpen] = useState(true);
   const [feeBps, setFeeBps] = useState<number>(0);
   const [treasuryAddr, setTreasuryAddr] = useState<Address | null>(null);
@@ -122,6 +138,11 @@ export default function Home() {
 
       const block = await publicClient.getBlock();
       setChainNow(block.timestamp);
+
+      // 票价是 immutable，共享模块只读一次（审计 E）。**必须在这里就读到**——
+      // 下面的弃期退款金额要用它重算，用组件 state 里可能还是 0 的旧值会算出 0
+      await loadTokenMeta();
+      if (ticketPrice !== TOKEN.ticketPrice) setTicketPrice(TOKEN.ticketPrice);
 
       const cur = (await publicClient.readContract({
         address: addresses.lottery,
@@ -193,6 +214,51 @@ export default function Home() {
       }
       setRounds(infos);
 
+      // FR-C-29：作废期的待退票款。作废是罕见事件，只在真的出现 ABANDONED 期时
+      // 才多打这几次 RPC；金额用与合约**完全相同**的逐条算式重算（票款 − 该期抽成），
+      // 避免用批量公式算出一个与链上不符的数字骗用户
+      if (account) {
+        const abandoned = infos.filter((r) => r.state === 5);
+        const found: RefundInfo[] = [];
+        for (const r of abandoned) {
+          try {
+            const feeBps = (await publicClient.readContract({
+              address: addresses.lottery,
+              abi: lotteryAbi,
+              functionName: "feeBpsOf",
+              args: [r.id],
+            })) as number;
+            const ranges = (await publicClient.readContract({
+              address: addresses.lottery,
+              abi: lotteryAbi,
+              functionName: "getRanges",
+              args: [r.id, 0, 500],
+            })) as readonly { start: number; end: number; owner: Address }[];
+            const indexes: number[] = [];
+            let amount = 0n;
+            for (let i = 0; i < ranges.length; i++) {
+              if (ranges[i].owner.toLowerCase() !== account.toLowerCase()) continue;
+              const done = (await publicClient.readContract({
+                address: addresses.lottery,
+                abi: lotteryAbi,
+                functionName: "rangeRefunded",
+                args: [r.id, i],
+              })) as boolean;
+              if (done) continue;
+              const cost = BigInt(ranges[i].end - ranges[i].start) * TOKEN.ticketPrice;
+              amount += cost - (cost * BigInt(feeBps)) / 10000n;
+              indexes.push(i);
+            }
+            if (indexes.length > 0) found.push({ roundId: r.id, rangeIndexes: indexes, amount });
+          } catch {
+            // 单期读取失败不影响其它期，下一轮刷新重试
+          }
+        }
+        setRefunds(found);
+      } else {
+        setRefunds([]);
+      }
+
       if (account) {
         const curRanges = (await publicClient.readContract({
           address: addresses.lottery,
@@ -232,6 +298,23 @@ export default function Home() {
           functionName: "s_accruedFees",
         })) as bigint,
       );
+      // withdrawableFees 是 R50 A-1 才加的函数。部署过渡期里链上可能还是旧字节码，
+      // 那时这次调用会 revert —— 而 refresh 是一个大 try 块，**任何一次读取失败
+      // 都会中断其后的全部读取**（费率、可分配额、treasury 全部读不到，界面显示
+      // 抽成 0.00%）。这正是 R20 时 ticketsOwned 踩过的同一个结构问题，当时只给
+      // 那一次调用单独兜了底。新增读取一律要自带兜底，直到 refresh 被拆成
+      // 逐项独立的读取为止
+      try {
+        setWithdrawable(
+          (await publicClient.readContract({
+            address: addresses.lottery,
+            abi: lotteryAbi,
+            functionName: "withdrawableFees",
+          })) as bigint,
+        );
+      } catch {
+        setWithdrawable(null); // 旧合约没有这个函数：显示为未知，而不是骗人的 0
+      }
       const liveTreasury = (await publicClient.readContract({
         address: addresses.lottery,
         abi: lotteryAbi,
@@ -289,9 +372,6 @@ export default function Home() {
             })) as bigint)
           : 0n,
       );
-      // 票价是 immutable，共享模块只读一次（审计 E）
-      await loadTokenMeta();
-      if (ticketPrice !== TOKEN.ticketPrice) setTicketPrice(TOKEN.ticketPrice);
     } catch (e) {
       log("err", `刷新失败：${(e as Error).message.slice(0, 120)}`);
     }
@@ -400,7 +480,7 @@ export default function Home() {
   const write = useCallback(
     async (
       address: Address,
-      abi: typeof lotteryAbi,
+      abi: Abi,
       functionName: string,
       args: unknown[],
       value?: bigint,
@@ -761,6 +841,40 @@ export default function Home() {
           </p>
         </section>
 
+        {refunds.length > 0 && (
+          <section className="card">
+            <h2>待退票款（弃期）</h2>
+            <p style={{ color: "var(--muted)", fontSize: 12 }}>
+              这些期在 DRAWING 状态卡死超过 30 天后被作废（FR-C-29）。票款按「票价 × 张数 −
+              该期抽成」原路退回，可分批取回，没有期限。
+            </p>
+            {refunds.map((r) => (
+              <div className="row" key={r.roundId}>
+                <span className="k">
+                  第 {r.roundId} 期 · {r.rangeIndexes.length} 条购票记录
+                </span>
+                <span className="v">
+                  {fmt6(r.amount)}{" "}
+                  <button
+                    className="btn primary"
+                    disabled={busy !== null}
+                    onClick={() =>
+                      act(`取回第 ${r.roundId} 期票款`, () =>
+                        write(addresses.lottery, lotteryAbi, "refundAbandoned", [
+                          r.roundId,
+                          r.rangeIndexes,
+                        ]),
+                      )
+                    }
+                  >
+                    取回票款
+                  </button>
+                </span>
+              </div>
+            ))}
+          </section>
+        )}
+
         <section className="card">
           <h2>我的奖金</h2>
           {claimable.length === 0 ? (
@@ -796,11 +910,25 @@ export default function Home() {
         </section>
 
         <section className="card">
-          <h2>运营（owner = {IS_LOCAL ? "账户 #0" : "部署者"}）</h2>
+          {/* Q9 方案 B 之后，测试网/主网的 owner 是 LotteryAdmin 而不是部署者 EOA。
+              此处原先写死「部署者」并把 setSalesPaused 直接打到 Lottery 上——
+              那笔交易在部署后**必然 revert**（第 50 轮 W-2） */}
+          <h2>
+            运营（owner ={" "}
+            {IS_LOCAL ? "账户 #0" : addresses.lotteryAdmin ? "LotteryAdmin" : "部署者"}）
+          </h2>
           <div className="row">
             <span className="k">累计抽成</span>
             <span className="v">{fmt6(fees)}</span>
           </div>
+          {withdrawable !== null && withdrawable < fees && (
+            <div className="row">
+              <span className="k">其中可提取</span>
+              <span className="v" title="其余为当期开奖奖励的预留，该期开出后自动释放">
+                {fmt6(withdrawable)}
+              </span>
+            </div>
+          )}
           <div className="row">
             <span className="k">treasury</span>
             <span className="v addr">{treasuryAddr ? short(treasuryAddr) : "…"}</span>
@@ -819,7 +947,7 @@ export default function Home() {
           <div style={{ marginTop: 8 }}>
             <button
               className="btn"
-              disabled={busy !== null || fees === 0n}
+              disabled={busy !== null || withdrawable === 0n}
               onClick={() => act("提取抽成到 treasury", () => write(addresses.lottery, lotteryAbi, "withdrawFees", []))}
             >
               提取抽成
@@ -827,14 +955,26 @@ export default function Home() {
             <button
               className="btn"
               disabled={busy !== null}
-              onClick={() => act(paused ? "恢复售票" : "暂停售票", () => write(addresses.lottery, lotteryAbi, "setSalesPaused", [!paused]))}
+              onClick={() =>
+                act(paused ? "恢复售票" : "暂停售票", () =>
+                  // 三项业务权限必须经 LotteryAdmin 转发（SPEC Q9 方案 B）；
+                  // 本地部署没有 admin，owner 仍是 EOA，直接打到 Lottery
+                  addresses.lotteryAdmin
+                    ? write(addresses.lotteryAdmin, lotteryAdminAbi, "setSalesPaused", [!paused])
+                    : write(addresses.lottery, lotteryAbi, "setSalesPaused", [!paused]),
+                )
+              }
             >
               {paused ? "恢复售票" : "暂停售票"}
             </button>
           </div>
           <p style={{ color: "var(--muted)", marginTop: 8, fontSize: 12 }}>
-            {IS_LOCAL ? "owner 操作需切到账户 #0。" : "owner 操作需用部署者钱包。"}
-            暂停只影响购票，领奖不受影响（FR-C-23）。
+            {IS_LOCAL
+              ? "owner 操作需切到账户 #0。"
+              : addresses.lotteryAdmin
+                ? `暂停/恢复经 LotteryAdmin（${short(addresses.lotteryAdmin)}）转发，需用它的 s_owner 钱包。`
+                : "owner 操作需用部署者钱包。"}
+            暂停只影响购票，领奖不受影响（FR-C-23）。提取抽成任何人可触发，钱只会去 treasury。
           </p>
         </section>
 

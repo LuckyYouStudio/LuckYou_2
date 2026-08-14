@@ -591,11 +591,17 @@ contract LotterySettleClaimTest is LotteryTestBase {
 
         uint256 pot1 = 99e14; // round1 已结算未领
         uint256 pot2 = _potOf(2);
+        // 第 50 轮 A-1 之后，withdrawFees 会为**当期**（第 2 期，仍 OPEN）的开奖奖励
+        // 留一份，因此到账额是 withdrawableFees() 而非裸的 s_accruedFees。
+        // 留下的那份仍在 accruedFees 里，会在第 2 期开出时发给触发者
+        uint256 withdrawable = lottery.withdrawableFees();
+        uint256 reserved = fees - withdrawable;
+        assertGt(reserved, 0, "sanity: round 2 is open and reserves its keeper reward");
         vm.prank(makeAddr("anyone"));
         lottery.withdrawFees();
 
-        assertEq(treasury.balance, fees);
-        assertEq(lottery.s_accruedFees(), 0);
+        assertEq(treasury.balance, withdrawable);
+        assertEq(lottery.s_accruedFees(), reserved);
         assertEq(_potOf(2), pot2, unicode"奖池不受影响");
         // FR-C-20 验收：提走全部 fees 后，合约余额仍 ≥ 所有未领奖金 + 未领的开奖奖励
         assertGe(address(lottery).balance, pot1 + pot2 + lottery.s_pendingKeeperRewards());

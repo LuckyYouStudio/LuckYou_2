@@ -23,6 +23,11 @@ const TICKETS_BOUGHT = parseAbiItem(
 const PRIZE_CLAIMED = parseAbiItem(
   "event PrizeClaimed(uint32 indexed roundId, address indexed winner, uint8 tier, uint256 amount)",
 );
+// FR-C-29 的弃期退款。不扫这个事件，「累计购票支出」就把已经退回的钱也算成支出，
+// 净盈亏因此被系统性低估（第 50 轮 W-3）
+const TICKETS_REFUNDED = parseAbiItem(
+  "event TicketsRefunded(uint32 indexed roundId, address indexed buyer, uint256 amount)",
+);
 // Base 公共 RPC（sepolia.base.org / mainnet.base.org）的 eth_getLogs 硬上限是 **2000 块**，
 // 超出直接 -32602 "query exceeds max block range 2000"。此处 to = from + BLOCK_CHUNK，
 // 单段块数 = BLOCK_CHUNK + 1，故取 1999 恰好贴满 2000。
@@ -50,6 +55,12 @@ interface ClaimRecord {
   block: bigint;
 }
 
+interface RefundRecord {
+  roundId: number;
+  amount: bigint;
+  block: bigint;
+}
+
 function fmt6(x: bigint): string {
   return fmtToken(x);
 }
@@ -58,6 +69,7 @@ export default function History() {
   const [account, setAccount] = useState<string>(IS_LOCAL ? ANVIL_ACCOUNTS[0].address : "");
   const [buys, setBuys] = useState<BuyRecord[]>([]);
   const [claims, setClaims] = useState<ClaimRecord[]>([]);
+  const [refunds, setRefunds] = useState<RefundRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // 非 null 表示只扫到了这个区块之后的记录，更早的未显示
@@ -69,6 +81,7 @@ export default function History() {
     const myReq = ++reqRef.current;
     setBuys([]);
     setClaims([]);
+    setRefunds([]);
     setTruncatedAt(null);
     if (!isAddress(account)) return;
     setLoading(true);
@@ -78,6 +91,7 @@ export default function History() {
       const latest = await publicClient.getBlockNumber();
       const buyRecords: BuyRecord[] = [];
       const claimRecords: ClaimRecord[] = [];
+      const refundRecords: RefundRecord[] = [];
 
       // 从合约部署块起分段扫描（FR-W-03：仅靠事件重建历史）。
       // 原实现是「两次 getLogs 串行 await、分段也串行」：Base 出块 2 秒 ⇒ 每年约 1576 万块
@@ -99,7 +113,7 @@ export default function History() {
       }
 
       const scanRange = async (r: { from: bigint; to: bigint }) => {
-        const [bought, claimed] = await Promise.all([
+        const [bought, claimed, refunded] = await Promise.all([
           publicClient.getLogs({
             address: addresses.lottery,
             event: TICKETS_BOUGHT,
@@ -114,8 +128,15 @@ export default function History() {
             fromBlock: r.from,
             toBlock: r.to,
           }),
+          publicClient.getLogs({
+            address: addresses.lottery,
+            event: TICKETS_REFUNDED,
+            args: { buyer: account as Address },
+            fromBlock: r.from,
+            toBlock: r.to,
+          }),
         ]);
-        return { bought, claimed };
+        return { bought, claimed, refunded };
       };
 
       // 并发度不宜再高：公共 RPC 会限流，超过约 8 路反而更慢
@@ -123,7 +144,7 @@ export default function History() {
       for (let i = 0; i < ranges.length; i += CONCURRENCY) {
         if (myReq !== reqRef.current) return; // 用户已改查询，立刻停手，别再打 RPC
         const batch = await Promise.all(ranges.slice(i, i + CONCURRENCY).map(scanRange));
-        for (const { bought, claimed } of batch) {
+        for (const { bought, claimed, refunded } of batch) {
           for (const log of bought) {
             buyRecords.push({
               roundId: Number(log.args.roundId),
@@ -140,14 +161,23 @@ export default function History() {
               block: log.blockNumber,
             });
           }
+          for (const log of refunded) {
+            refundRecords.push({
+              roundId: Number(log.args.roundId),
+              amount: log.args.amount ?? 0n,
+              block: log.blockNumber,
+            });
+          }
         }
       }
       // 并发返回的顺序不保证，按区块号排序后再倒序展示
       buyRecords.sort((a, b) => (a.block < b.block ? -1 : a.block > b.block ? 1 : 0));
       claimRecords.sort((a, b) => (a.block < b.block ? -1 : a.block > b.block ? 1 : 0));
+      refundRecords.sort((a, b) => (a.block < b.block ? -1 : a.block > b.block ? 1 : 0));
       if (myReq !== reqRef.current) return; // 已被更新的查询取代，丢弃过期结果
       setBuys(buyRecords.reverse());
       setClaims(claimRecords.reverse());
+      setRefunds(refundRecords.reverse());
       setTruncatedAt(truncatedFrom);
     } catch (e) {
       if (myReq !== reqRef.current) return;
@@ -163,6 +193,7 @@ export default function History() {
 
   const totalSpent = buys.reduce((s, b) => s + BigInt(b.quantity) * TOKEN.ticketPrice, 0n);
   const totalWon = claims.reduce((s, c) => s + c.amount, 0n);
+  const totalRefunded = refunds.reduce((s, r) => s + r.amount, 0n);
 
   return (
     <main>
@@ -173,7 +204,7 @@ export default function History() {
         <Link href="/" style={{ color: "var(--blue)" }}>
           ← 返回测试台
         </Link>
-        {"　"}数据全部来自链上事件（TicketsBought / PrizeClaimed），无后端
+        {"　"}数据全部来自链上事件（TicketsBought / PrizeClaimed / TicketsRefunded），无后端
       </p>
 
       <div className="card" style={{ marginBottom: 16 }}>
@@ -204,6 +235,14 @@ export default function History() {
           <span className="k">累计已领奖金</span>
           <span className="v big">{fmt6(totalWon)}</span>
         </div>
+        {totalRefunded > 0n && (
+          <div className="row">
+            <span className="k">累计弃期退款</span>
+            <span className="v" title="卡死超 30 天被作废的期，按票款净额原路退回（FR-C-29）">
+              {fmt6(totalRefunded)}
+            </span>
+          </div>
+        )}
         {loading && <p style={{ color: "var(--muted)" }}>正在扫描链上事件…</p>}
         {error && <p style={{ color: "var(--red)" }}>加载失败：{error}</p>}
         {truncatedAt !== null && !loading && (

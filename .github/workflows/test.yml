@@ -41,11 +41,17 @@ jobs:
       - name: Run Forge tests
         run: forge test -vvv
 
-      # FR-T-01 要求行覆盖 >= 90%。此前只靠人工核对，CI 里没有闸
+      # FR-T-01 要求行覆盖 >= 90%。此前只靠人工核对，CI 里没有闸。
+      # 排除项原为 "script|mocks|cre" —— 但 `src/cre/` 里只有 ReceiverTemplate /
+      # IReceiver / IERC165 是 vendored 的上游代码，`LotteryKeeperReceiver.sol`
+      # 是我们自己写的、且是生产 keeper 的链上落点。把整个目录排掉，等于让它
+      # 从未被覆盖率看过一眼 —— 第 50 轮 A-3（桥接器把开奖奖励永久锁死）
+      # 正是躲在这个盲区里。现在只排掉真正 vendored 的三个文件
       - name: 覆盖率闸（FR-T-01：Lottery.sol 行覆盖 >= 90%）
         run: |
           set -euo pipefail
-          forge coverage --no-match-coverage "script|mocks|cre" --report summary | tee /tmp/cov.txt
+          forge coverage --no-match-coverage "script|mocks|ReceiverTemplate|IReceiver|IERC165" \
+            --report summary | tee /tmp/cov.txt
           line=$(grep -E '\| src/Lottery\.sol' /tmp/cov.txt | head -1)
           if [ -z "$line" ]; then
             echo "::error::覆盖率报告里找不到 src/Lottery.sol"

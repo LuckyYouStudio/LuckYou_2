@@ -285,6 +285,13 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         // 追赶循环在构造时就跑上百万次：实测 anchor=1 且 interval 取允许的最小值 6301 时
         // 需要 207.9M gas，必然 OOG。加一道显式闸，让配错失败得清楚（R20 L-4）
         if (uint256(anchorTime) + 365 days < block.timestamp) revert InvalidSchedule();
+        // 对称的另一侧同样致命，而 R20 L-4 只挡了一半（第 50 轮 A-4）：锚点若落在未来，
+        // 第 1 期的 closeTime 就跟着落在未来，`performUpkeep` 永远不到期、期号永不推进，
+        // 而 `buyTickets` 只看 state 与 closeTime，实例会**照常收钱**。日程无 setter、
+        // FR-C-24 又禁止任何救援手段，这种实例只能作废重部。锚点按定义是「一个已经
+        // 发生过的场次」（Deploy.s.sol 取上一个周二 12:00 UTC，或部署当刻），因此
+        // 要求它不晚于当前时刻不会拒绝任何合法配置
+        if (anchorTime > block.timestamp) revert InvalidSchedule();
         if (tierBps.length == 0 || tierBps.length != tierWinnerCounts.length) {
             revert InvalidTierConfig();
         }
@@ -632,6 +639,28 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         external
         nonReentrant
     {
+        _refundAbandoned(roundId, rangeIndexes, msg.sender);
+    }
+
+    /// @notice 同 refundAbandoned，但把票款退到指定地址。
+    /// @dev 与 `claimTo` 同构、同理由，**不增加任何权限面**：Range 归属恒以
+    ///      `msg.sender` 为准，`to` 只决定钱付到哪里。
+    ///      存在的理由（第 50 轮 A-2）：FR-C-29 的退款通道晚于 `claimTo` 加入，
+    ///      重新引入了 R20 M-1 那一类缺陷——没有 `receive`/`fallback` 的合约钱包
+    ///      买了票、该期又卡死作废后，`refundAbandoned` 恒 revert `TransferFailed`。
+    ///      而退款**没有** `rolloverExpired` 那样的过期兜底，这笔钱会永久留在
+    ///      该期 `pot` 里，成为偿付性台账上一笔永远无法清偿的负债
+    function refundAbandonedTo(uint32 roundId, uint256[] calldata rangeIndexes, address to)
+        external
+        nonReentrant
+    {
+        if (to == address(0)) revert InvalidRecipient();
+        _refundAbandoned(roundId, rangeIndexes, to);
+    }
+
+    /// @dev refundAbandoned / refundAbandonedTo 的共用实现：Range 归属恒以
+    ///      `msg.sender` 为准，`to` 只决定收款地址
+    function _refundAbandoned(uint32 roundId, uint256[] calldata rangeIndexes, address to) private {
         Round storage r = s_rounds[roundId];
         if (r.state != RoundState.ABANDONED) revert RoundNotAbandoned();
         TicketRange[] storage ranges = s_ranges[roundId];
@@ -651,8 +680,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         if (total == 0) revert NothingToClaim();
 
         r.pot -= total;
+        // 事件里记的是**购票者**（msg.sender），不是收款地址：与 PrizeClaimed 同一口径，
+        // FR-C-25 的事件重建器据此归属退款，收款地址只是支付细节
         emit TicketsRefunded(roundId, msg.sender, total);
-        _sendValue(msg.sender, total);
+        _sendValue(to, total);
     }
 
     /// @notice 某条 Range 是否已退款（作废期用）
@@ -662,12 +693,29 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
 
     /// @notice 领取累计的开奖奖励（pull 模式，FR-C-30）
     function claimKeeperReward() external nonReentrant {
+        _claimKeeperReward(msg.sender);
+    }
+
+    /// @notice 同 claimKeeperReward，但把奖励付到指定地址。
+    /// @dev 与 `claimTo` 同构、同理由，**不增加任何权限面**：奖励归属恒以
+    ///      `msg.sender` 为准，`to` 只决定钱付到哪里。
+    ///      存在的理由（第 50 轮 A-3）：`performUpkeep` 无权限，触发者常常是**合约**——
+    ///      SPEC Q8 的 CRE 桥接器就是最典型的一个。没有 `receive`/`fallback` 的
+    ///      触发者永远领不走自己的奖励，那笔已从 `s_accruedFees` 划出的钱就成了
+    ///      `s_pendingKeeperRewards` 里一笔永远无法清偿的负债
+    function claimKeeperRewardTo(address to) external nonReentrant {
+        if (to == address(0)) revert InvalidRecipient();
+        _claimKeeperReward(to);
+    }
+
+    /// @dev claimKeeperReward / claimKeeperRewardTo 的共用实现
+    function _claimKeeperReward(address to) private {
         uint256 amount = s_keeperRewards[msg.sender];
         if (amount == 0) revert NoRewardToClaim();
         s_keeperRewards[msg.sender] = 0;
         s_pendingKeeperRewards -= amount;
         emit KeeperRewardClaimed(msg.sender, amount);
-        _sendValue(msg.sender, amount);
+        _sendValue(to, amount);
     }
 
     /// @notice 某地址已记账、尚未领取的开奖奖励
@@ -681,18 +729,35 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         Round storage r = s_rounds[roundId];
         if (r.state != RoundState.OPEN || r.ticketCount == 0) return 0;
         if (block.timestamp < uint256(r.closeTime) + SEAL_GAP) return 0;
-        uint256 gross = uint256(r.ticketCount) * i_ticketPrice;
-        uint256 reward = ((gross - (r.pot - r.carriedPot)) * KEEPER_REWARD_BPS) / BPS_DENOMINATOR;
-        if (reward > i_ticketPrice) reward = i_ticketPrice;
+        uint256 reward = _keeperRewardGross(r);
         if (reward > s_accruedFees) reward = s_accruedFees;
         return reward;
     }
 
-    /// @notice 把已分账的运营抽成全额转给 treasury。任何人可触发，资金只会去 treasury
+    /// @notice 现在调 `withdrawFees` 实际能提走多少（= 累计抽成 − 为当期开奖奖励预留的部分）。
+    /// @dev 前端应展示此值而非裸的 `s_accruedFees`，否则会对运营方虚报可提金额
+    function withdrawableFees() external view returns (uint256) {
+        uint256 accrued = s_accruedFees;
+        uint256 reserved = _keeperRewardReserve();
+        return accrued > reserved ? accrued - reserved : 0;
+    }
+
+    /// @notice 把已分账的运营抽成转给 treasury。任何人可触发，资金只会去 treasury。
+    /// @dev **会为当期的开奖奖励预留一份**（至多一张票价，FR-C-30）。
+    ///      不预留的话，`_accrueKeeperReward` 的第三道夹逼「不超过当下实际尚存的
+    ///      accruedFees」就变成了一个人人可拉的断路器：本函数无权限、约 3 万 gas，
+    ///      任何人在封盘期（停售 → 开奖之间、抽成不再增加的那 75 分钟）调一次，
+    ///      本期的开奖奖励就恒为 0（第 50 轮 A-1，有 PoC）。那等于零成本架空 FR-C-30，
+    ///      而 FR-C-30 存在的全部意义正是「运营方缺席时仍有人有理由接手」。
+    ///      运营方自己例行提费同样会误伤，这一点比蓄意骚扰更可能发生。
+    ///      预留额随本期抽成增长而增长（奖励 = 抽成的 20%，故留存永远够付），
+    ///      并在该期开出后自动释放，不构成任何长期沉淀
     function withdrawFees() external nonReentrant {
-        uint256 amount = s_accruedFees;
+        uint256 accrued = s_accruedFees;
+        uint256 reserved = _keeperRewardReserve();
+        uint256 amount = accrued > reserved ? accrued - reserved : 0;
         if (amount == 0) revert NoFeesToWithdraw();
-        s_accruedFees = 0;
+        s_accruedFees = accrued - amount;
         address treasury = s_treasury;
         emit FeesWithdrawn(treasury, amount);
         _sendValue(treasury, amount);
@@ -927,22 +992,38 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     ///        3. 不超过实际尚存的 accruedFees——抽成可能已被 withdrawFees 提走，
     ///           不夹这一下会下溢
     function _accrueKeeperReward(uint32 roundId, Round storage r) private {
-        // 该期抽成 = 票款总额 − 自售净额。两个数都已在链上，且与购票时
-        // 「pot += cost - fee」逐笔对应，因此这个减法是精确的，无需新增存储。
-        // 注资只进 pot 也只进 carriedPot，在差值里自动抵消，不会被误算成抽成
-        uint256 gross = uint256(r.ticketCount) * i_ticketPrice;
-        uint256 selfSold = r.pot - r.carriedPot; // carriedPot <= pot 恒成立
-        uint256 reward = ((gross - selfSold) * KEEPER_REWARD_BPS) / BPS_DENOMINATOR;
-
-        if (reward > i_ticketPrice) reward = i_ticketPrice;
+        uint256 reward = _keeperRewardGross(r);
         uint256 available = s_accruedFees;
-        if (reward > available) reward = available;
+        if (reward > available) reward = available; // 夹逼 ③，见 withdrawFees 的预留
         if (reward == 0) return;
 
         s_accruedFees -= reward;
         s_keeperRewards[msg.sender] += reward;
         s_pendingKeeperRewards += reward;
         emit KeeperRewarded(roundId, msg.sender, reward);
+    }
+
+    /// @dev 开奖奖励的毛额（只含前两道夹逼：按该期抽成的比例、上限一张票价）。
+    ///      单独抽出来是为了让 `_accrueKeeperReward`、`pendingKeeperReward` 与
+    ///      `withdrawFees` 的预留额三处共用同一套算式——它们一旦分叉，
+    ///      要么界面报的数与实发的不一致，要么预留额不足以覆盖实发额
+    function _keeperRewardGross(Round storage r) private view returns (uint256 reward) {
+        // 该期抽成 = 票款总额 − 自售净额。两个数都已在链上，且与购票时
+        // 「pot += cost - fee」逐笔对应，因此这个减法是精确的，无需新增存储。
+        // 注资只进 pot 也只进 carriedPot，在差值里自动抵消，不会被误算成抽成
+        uint256 gross = uint256(r.ticketCount) * i_ticketPrice;
+        uint256 selfSold = r.pot - r.carriedPot; // carriedPot <= pot 恒成立
+        reward = ((gross - selfSold) * KEEPER_REWARD_BPS) / BPS_DENOMINATOR;
+        if (reward > i_ticketPrice) reward = i_ticketPrice; // 夹逼 ②
+    }
+
+    /// @dev `withdrawFees` 必须为「尚未开出的那一期」留下的开奖奖励。
+    ///      只有仍处于 OPEN 的当期存在未记账的奖励：一旦离开 OPEN，
+    ///      奖励要么已在 `performUpkeep` 里记账（DRAWING），要么按规则不发（VOIDED）
+    function _keeperRewardReserve() private view returns (uint256) {
+        Round storage r = s_rounds[s_currentRound];
+        if (r.state != RoundState.OPEN) return 0;
+        return _keeperRewardGross(r);
     }
 
     /// @dev 按自售额配比扣留超额 carry（FR-C-27）：本期可分配的滚存/注资上限 =

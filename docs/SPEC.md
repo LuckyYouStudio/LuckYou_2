@@ -125,7 +125,15 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
     构造参数的场次间隔 **MUST** 大于 `SEAL_GAP + MIN_SALES_WINDOW`。
     理由：`performUpkeep` 无权限、任何人可择时调用，若无下限，调用者可卡在下一场次前
     1 秒开期，使新期仅有 1 秒售票窗口供自己独占（同时并解旧发现 H）
-  - 验收：keeper 缺席时择时调用 `performUpkeep`，新期售票窗口仍 ≥ MIN_SALES_WINDOW
+  - **锚点必须落在过去（2026-08-14 第 50 轮 A-4 增）**：`anchorTime` **MUST**
+    `<= block.timestamp`，且 **MUST** 不早于 `block.timestamp - 365 days`（R20 L-4）。
+    两侧都是致命的、且都不可修复（日程全合约无 setter，FR-C-24 又禁止救援手段）：
+    过老 ⇒ 构造时的追赶循环 OOG，部署直接失败（吵闹、无害）；
+    **落在未来 ⇒ 第 1 期的 closeTime 也落在未来，`performUpkeep` 永远不到期、
+    期号永不推进，而 `buyTickets` 只看 state 与 closeTime，实例会照常收钱**（安静、致命）。
+    锚点按定义就是「一个已经发生过的场次」，因此这道闸不会拒绝任何合法配置
+  - 验收：keeper 缺席时择时调用 `performUpkeep`，新期售票窗口仍 ≥ MIN_SALES_WINDOW；
+    `test/AuditR50Poc.t.sol::test_RevertWhen_AnchorIsInTheFuture`
 - **FR-C-09** `buyTickets` 在 `state != OPEN` 或 `block.timestamp >= closeTime` 时
   **MUST** revert（即使 keeper 还没跑）
   - 理由：防止有人卡在截止边缘、已知即将开奖时下注
@@ -329,6 +337,14 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
     恰好等于该期 `pot`，分文不差。每条 Range **MUST** 用与购票时相同的算式重算
   - 非自售部分（注资 / 滚存承接）**MUST** 退回缓冲区，不属于购票者
   - **MUST** 按 Range 而非按地址记账已退款状态，以同时支持分批取回与杜绝重复领取
+  - **MUST** 另提供 `refundAbandonedTo(roundId, rangeIndexes[], to)`（2026-08-14
+    第 50 轮 A-2 增）：Range 归属恒以 `msg.sender` 为准，`to` 只决定钱付到哪里，
+    **不增加任何权限面**；`to` **MUST NOT** 为零地址。
+    存在的理由与 `claimTo`（FR-C-17）**完全同源**：本通道晚于 `claimTo` 加入，
+    重新引入了 R20 M-1 那一类缺陷 —— 没有 `receive`/`fallback` 的合约钱包买了票、
+    该期又卡死作废后，`refundAbandoned` 恒 revert `TransferFailed`。
+    而退款**没有** `rolloverExpired` 那样的过期兜底，那笔钱会永久留在该期 `pot` 里，
+    成为偿付性台账上一笔永远无法清偿的负债
   - 作废期 **MUST** 惰性化：不可重复作废、不可 `retryDraw`、不可 `claim`
   - 验收：`test/LotteryAbandon.t.sol`（含 fuzz 证明退款总额恒等于自售净额）；
     偿付性不变量 **MUST** 把 ABANDONED 期的 `pot` 计入应付义务，且该分支
@@ -351,6 +367,25 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   - **MUST** 采用 pull 模式（记账 + `claimKeeperReward`）。当场转账不可行：
     `performUpkeep` 内有 `try this.requestRandomWordsSelf()` 外部自调用，
     直接加 `nonReentrant` 会把自己挡住；而中途向任意调用者转原生币则开了重入口子
+  - **MUST** 另提供 `claimKeeperRewardTo(to)`（2026-08-14 第 50 轮 A-3 增）：
+    奖励归属恒以 `msg.sender` 为准，`to` 只决定钱付到哪里，**不增加任何权限面**；
+    `to` **MUST NOT** 为零地址。理由同 `claimTo`/`refundAbandonedTo`——
+    `performUpkeep` 无权限，触发者**常常是合约**（Q8 的 CRE 桥接器就是最典型的一个），
+    没有 `receive`/`fallback` 的触发者永远领不走自己的奖励，那笔已从 `s_accruedFees`
+    划出的钱就成了 `s_pendingKeeperRewards` 里一笔永远无法清偿的负债
+  - **`withdrawFees` MUST 为当期（仍 OPEN 的那一期）预留一份奖励额度**
+    （2026-08-14 第 50 轮 A-1 增）。不预留的话，上面夹逼 ② 的
+    「不超过当下实际尚存的 `accruedFees`」就变成了一个**人人可拉的断路器**：
+    `withdrawFees` 无权限、约 3 万 gas，任何人在封盘期（停售 → 开奖之间、
+    抽成不再增加的那 75 分钟）调一次，本期奖励恒为 0 —— 无需抢跑、无需竞速，
+    零成本架空本条需求的全部意义。**运营方自己例行提费同样会误伤**，
+    这比蓄意骚扰更可能发生。
+    - 预留额 = 上面同一套算式（该期抽成 × 20%，夹一次票价上限），**MUST** 与
+      发放算式共用同一份实现，两者分叉即意味着预留不足或界面虚报
+    - 预留 **MUST NOT** 把提费通道堵死：奖励恒为该期抽成的 20%，故只要有抽成，
+      可提额就严格大于 0；零票的期不预留任何东西
+    - **MUST** 提供 `withdrawableFees()` 视图，前端 **MUST** 展示它而非裸的
+      `s_accruedFees`，否则会对运营方虚报可提金额
   - 未领取的奖励 **MUST** 计入偿付性不变量（`s_pendingKeeperRewards`）
   - **诚实的边界**：一次 `performUpkeep` 约 17.3 万 gas，主网连同 L1 数据费约
     1e-5 ETH。20% 意味着**约 50 张票以上的期才够覆盖 gas**，更小的期无人会来触发。
@@ -480,7 +515,15 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   （测试网 2026-06-24 停服，主网 2026-07-31，替代品为 CRE）。合约的
   checkUpkeep/performUpkeep 接口不变——keeper 本就不在信任边界内
   （performUpkeep/retryDraw 任何人可调，随机数安全仅依赖 VRF）。
-  测试阶段用自托管轮询 keeper 触发开奖；主网前迁移到 CRE 定时工作流
+  测试阶段用自托管轮询 keeper 触发开奖；主网前迁移到 CRE 定时工作流。
+  - **CRE 桥接器 MUST 能取回自己名下的开奖奖励**（2026-08-14 第 50 轮 A-3）：
+    CRE 的写入只能投递到实现 `IReceiver` 的合约，因此转调 `performUpkeep` 的
+    `msg.sender` 是 `LotteryKeeperReceiver` 本身，FR-C-30 的奖励记在**它**名下。
+    初版桥接器既没有领取路径、也没有 `receive` —— 每一期最多一张票价的运营抽成
+    被永久烧进一个取不出的余额。桥接器 **MUST** 提供 `receive()` 与一个
+    **无权限、无自由裁量**的 `sweepKeeperReward()`：金额与去向完全由链上状态决定，
+    去向是构造时钉死的 `i_rewardBeneficiary`（**MUST NOT** 有 setter，
+    否则本合约「没有可被滥用的杠杆」这个前提就没了）
 - **Q9（VRF 换源杠杆的根因修复，2026-08-11 提出；2026-08-13 已决：采纳 B + C）**：
   见 FR-C-22 的订正说明——`setCoordinator` 的修饰符是 `onlyOwnerOrCoordinator`，
   官方订阅迁移与 owner 私钥失窃两条路径都能造成**不可恢复的全局冻结**。
