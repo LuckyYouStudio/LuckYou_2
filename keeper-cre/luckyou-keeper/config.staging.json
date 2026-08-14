@@ -3,7 +3,7 @@
   "evms": [
     {
       "chainSelectorName": "ethereum-testnet-sepolia-base-1",
-      "lotteryAddress": "0x95b008Bc0B1969301a6d08828008aA66bC448627",
+      "lotteryAddress": "0x23bec642861319f5eDc6716A881164Aee3585b37",
       "receiverAddress": "0x8081f1cB5F5381ed3E5883950fb1925642071bf5"
     }
   ]

@@ -1,8 +1,8 @@
 {
   "chainId": 84532,
-  "lottery": "0x95b008Bc0B1969301a6d08828008aA66bC448627",
-  "lotteryAdmin": "0x849400335E0A48864e7C1221ce15Be9e12de6BFb",
-  "startBlock": 45430090,
+  "lottery": "0x23bec642861319f5eDc6716A881164Aee3585b37",
+  "lotteryAdmin": "0x0dCDfaBeA5a134B5d42A3a3BCbdb19e82181EF0A",
+  "startBlock": 45470471,
   "treasury": "0xA7b454432E0Ffe2e9C394c6045ec652e3b1e743f",
   "vrfCoordinator": "0x5C210eF41CD1a72de73bF76eC39637bB0d3d7BEE"
 }
