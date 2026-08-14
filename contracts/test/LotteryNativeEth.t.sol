@@ -154,8 +154,12 @@ contract LotteryNativeEthTest is LotteryTestBase {
 
         // 强塞的钱既不进奖池也无法被任何人取走——它就此沉没（FR-C-24 无救援手段的直接后果）
         uint256 treasuryBefore = treasury.balance;
+        // 开奖已按 FR-C-30 把一部分抽成划给了触发者，故此处必须重新读，
+        // 不能沿用开奖前的 feesBefore
+        uint256 feesNow = lottery.s_accruedFees();
+        assertLt(feesNow, feesBefore, "part of the fee went to the keeper reward");
         lottery.withdrawFees();
-        assertEq(treasury.balance - treasuryBefore, feesBefore, "only accrued fees leave");
+        assertEq(treasury.balance - treasuryBefore, feesNow, "only accrued fees leave");
         assertGe(address(lottery).balance, 5 ether, "force-fed ether is stranded");
     }
 

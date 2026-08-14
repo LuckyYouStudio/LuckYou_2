@@ -24,7 +24,11 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
 
 - **MUST NOT** 引入任何可升级代理（UUPS / Transparent / Beacon）
 - **MUST NOT** 做 KYC、地理封锁、法币出入金
-- **MUST NOT** 做推荐返佣、代币激励、NFT 门票
+- **MUST NOT** 做推荐返佣、NFT 门票
+- **MUST NOT** 发行任何代币（2026-08-13 澄清）。此前此处笼统写「代币激励」，
+  与 FR-C-30 的开奖奖励产生歧义——后者以**原生币**支付、资金来自运营抽成，
+  是**购买运维服务**而非参与激励，不在禁止之列。禁止的是发币、返佣、门票 NFT
+  这类改变代币经济结构的东西
 - **MUST NOT** 做后端数据库；历史数据一律从链上事件读取
 - 不做移动端 App，不做多语言
 
@@ -168,7 +172,9 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   把未领奖金**转入滚存缓冲区**（见 FR-C-28），**MUST NOT** 直接注入当前期——
   当前期可能已封盘、票已冻结，攻击者可预先卡位独占（第二轮 High A）
   - 验收：停摆 91 天后结算，中奖者仍可领奖；第三方在此之前无法 rollover
-- **FR-C-20** 运营抽成 **MUST** 与奖池分账记录（独立的 `accruedFees` 变量）
+- **FR-C-20** 运营抽成 **MUST** 与奖池分账记录（独立的 `accruedFees` 变量）。
+  抽成的一部分**可**流向触发开奖者（FR-C-30）——但那仍在抽成侧，
+  **奖池分文不动**这一条不受影响
   - 验收：提走全部 fees 后，各期 pot 之和不变，合约余额仍 ≥ 所有未领奖金
 - **FR-C-21** 抽成比例上限 `MAX_FEE_BPS` **MUST** 是 `constant`（1000 = 10%），
   owner 也无法突破。部署默认 `feeBps` **MUST** 为 100（1%）（2026-08-07 定）
@@ -317,6 +323,30 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
   - 验收：`test/LotteryAbandon.t.sol`（含 fuzz 证明退款总额恒等于自售净额）；
     偿付性不变量 **MUST** 把 ABANDONED 期的 `pot` 计入应付义务，且该分支
     **MUST** 有确定性测试保证被真正走到（fuzz 概率过低，实测长期为 0）
+
+- **FR-C-30** 开奖激励（2026-08-13 增）：`performUpkeep` 的调用者 **MUST** 获得奖励，
+  使「需要有人按时按按钮」变成「按了有钱拿」，从而在运营方缺席时仍有人有理由接手。
+  - 金额 **MUST** = `该期抽成 × KEEPER_REWARD_BPS`（20%），并依次夹逼：
+    ① **上限一张票价**；② **不超过当下实际尚存的 `accruedFees`**（抽成可能已提走，
+    不夹会下溢）
+  - 资金 **MUST** 只来自抽成，**MUST NOT** 动用奖池（FR-C-20 的分账仍然成立）
+  - **MUST** 是常量而非可调参数：多一个可调项就多一个信任面。代价是部署后无法
+    适应 gas 与币价的长期变化，只能重新部署——刻意接受
+  - **MUST** 按「该期自己的抽成」计算，**MUST NOT** 按历史累计——否则一个 1 张票的
+    小期能把之前大期赚的抽成吸走
+  - 零票作废（VOIDED）的期 **MUST NOT** 发放奖励——否则无人玩时可每个间隔
+    触发一次 VOID 刷钱
+  - `retryDraw` **MUST NOT** 发放任何奖励——否则可每 3 小时重试刷钱，
+    并顺带烧光运营方的 LINK
+  - **MUST** 采用 pull 模式（记账 + `claimKeeperReward`）。当场转账不可行：
+    `performUpkeep` 内有 `try this.requestRandomWordsSelf()` 外部自调用，
+    直接加 `nonReentrant` 会把自己挡住；而中途向任意调用者转原生币则开了重入口子
+  - 未领取的奖励 **MUST** 计入偿付性不变量（`s_pendingKeeperRewards`）
+  - **诚实的边界**：一次 `performUpkeep` 约 17.3 万 gas，主网连同 L1 数据费约
+    1e-5 ETH。20% 意味着**约 50 张票以上的期才够覆盖 gas**，更小的期无人会来触发。
+    奖励创造的是**动机**而非**机制**——冷启动阶段仍需运营方自己触发，
+    且它**不替代** `checkUpkeep` 定义的日程，只改变「谁来按按钮」
+  - 验收：`test/LotteryKeeperReward.t.sol`（三道闸各一条 + 上限 + 重入 + fuzz 证明奖池不受影响）
 
 ### 4.7 事件
 

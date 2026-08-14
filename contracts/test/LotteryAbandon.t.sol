@@ -90,7 +90,14 @@ contract LotteryAbandonTest is LotteryTestBase {
         // 全部退完后该期账面归零：证明退款总额 == 自售净额，分文不差
         (,,,, uint256 pot,,,,) = lottery.getRound(r);
         assertEq(pot, 0, "refunds exactly exhaust the round pot");
-        assertEq(address(lottery).balance, lottery.s_accruedFees(), "only fees remain");
+        // FR-C-30 之后抽成会拆成两个桶：一部分留在 s_accruedFees，
+        // 一部分作为开奖奖励记到 s_pendingKeeperRewards。钱没少，只是换了口袋，
+        // 所以这里必须把两个都算上——否则会误判成资金泄漏
+        assertEq(
+            address(lottery).balance,
+            lottery.s_accruedFees() + lottery.s_pendingKeeperRewards(),
+            "only fees (incl. accrued keeper rewards) remain"
+        );
     }
 
     /// @dev 同一条 Range 不得重复退款

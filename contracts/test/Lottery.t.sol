@@ -582,7 +582,12 @@ contract LotterySettleClaimTest is LotteryTestBase {
         _setupSettledRound100();
         _buy(alice, 50); // round2 再积累一点 fee
         uint256 fees = lottery.s_accruedFees();
-        assertEq(fees, 15e13); // 150 张票 × 1%
+        // FR-C-30 之后，_setupSettledRound100 里的那次开奖已把第 1 期抽成的 20%
+        // 划给了触发者，因此这里不再是「150 张票 × 1%」的整数，而要扣掉那一笔。
+        // 钱没少——它进了 s_pendingKeeperRewards，下面的偿付性断言会一并核对
+        uint256 keeperCut = lottery.s_pendingKeeperRewards();
+        assertGt(keeperCut, 0, "sanity: the draw paid a keeper reward");
+        assertEq(fees + keeperCut, 15e13, "150 tickets x 1%, split across the two buckets");
 
         uint256 pot1 = 99e14; // round1 已结算未领
         uint256 pot2 = _potOf(2);
@@ -592,8 +597,8 @@ contract LotterySettleClaimTest is LotteryTestBase {
         assertEq(treasury.balance, fees);
         assertEq(lottery.s_accruedFees(), 0);
         assertEq(_potOf(2), pot2, unicode"奖池不受影响");
-        // FR-C-20 验收：提走全部 fees 后，合约余额仍 ≥ 所有未领奖金
-        assertGe(address(lottery).balance, pot1 + pot2);
+        // FR-C-20 验收：提走全部 fees 后，合约余额仍 ≥ 所有未领奖金 + 未领的开奖奖励
+        assertGe(address(lottery).balance, pot1 + pot2 + lottery.s_pendingKeeperRewards());
     }
 
     function test_OwnerCannot_SetFeeAboveCap() public {

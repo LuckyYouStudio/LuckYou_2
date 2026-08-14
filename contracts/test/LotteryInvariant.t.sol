@@ -21,6 +21,7 @@ contract LotteryHandler is Test {
     uint256 public totalPrizesPaid;
     uint256 public totalFeesWithdrawn;
     uint256 public totalRefunded;
+    uint256 public totalKeeperPaid;
     uint256 public abandonOk;
     uint256 public abandonTried;
     uint32[] internal drawingRounds;
@@ -179,6 +180,15 @@ contract LotteryHandler is Test {
         }
     }
 
+    /// @dev 领取 FR-C-30 的开奖奖励。handler 自己就是 performUpkeep 的调用者，
+    ///      所以奖励会记在 handler 名下
+    function claimKeeperReward() external {
+        uint256 before = address(this).balance;
+        try lottery.claimKeeperReward() {
+            totalKeeperPaid += address(this).balance - before;
+        } catch {}
+    }
+
     /// @dev 覆盖 FR-C-29 逃生通道：卡死超 30 天的期可被任何人作废。
     ///      不加这两个 handler，新增的 ABANDONED 状态就是不变量测试里的死代码，
     ///      其记账错误不会被守恒检查发现（第 21 轮审计正是抓到过这类死路径）
@@ -294,8 +304,10 @@ contract LotteryInvariantTest is Test {
     /// @dev FR-T-03 不变量一：合约余额 >= 所有未领奖金 + accruedFees（此处收紧为恒等式）
     function invariant_SolvencyExact() public view {
         // 滚存缓冲区（修复 A）也是待并入下一新期的应付义务
-        uint256 obligations =
-            lottery.s_accruedFees() + lottery.s_pendingPot() + lottery.s_pendingTier1();
+        // s_pendingKeeperRewards 是 FR-C-30 记账但尚未领取的开奖奖励——
+        // 它是从 s_accruedFees 里挪出来的，两者都是应付义务，必须同时计入
+        uint256 obligations = lottery.s_accruedFees() + lottery.s_pendingPot()
+            + lottery.s_pendingTier1() + lottery.s_pendingKeeperRewards();
         uint32 cur = lottery.s_currentRound();
         for (uint32 id = 1; id <= cur; id++) {
             (Lottery.RoundState st,,,, uint256 pot, uint256 carry,,,) = lottery.getRound(id);
@@ -319,7 +331,7 @@ contract LotteryInvariantTest is Test {
         assertEq(
             handler.totalBought() + handler.totalInjected(),
             address(lottery).balance + handler.totalPrizesPaid() + handler.totalFeesWithdrawn()
-                + handler.totalRefunded(),
+                + handler.totalRefunded() + handler.totalKeeperPaid(),
             "conservation violated"
         );
     }
@@ -349,5 +361,19 @@ contract LotteryInvariantTest is Test {
         handler.refund(1, 0);
         invariant_SolvencyExact(); // 部分退款后仍然精确成立
         assertGt(handler.totalRefunded(), 0, "the refund path must actually execute");
+    }
+
+    /// @dev **确定性**覆盖 FR-C-30 的记账。同样不靠 fuzz 碰运气：
+    ///      未领取的开奖奖励是一笔真实的应付义务，必须被守恒检查真正走到
+    function test_SolvencyHoldsAcrossKeeperReward() public {
+        handler.buy(0, 200);
+        handler.draw(); // handler 自己触发，奖励记在它名下
+        invariant_SolvencyExact();
+
+        assertGt(lottery.s_pendingKeeperRewards(), 0, "reward must actually accrue");
+        handler.claimKeeperReward();
+        invariant_SolvencyExact();
+        assertGt(handler.totalKeeperPaid(), 0, "the reward payout path must actually execute");
+        assertEq(lottery.s_pendingKeeperRewards(), 0);
     }
 }

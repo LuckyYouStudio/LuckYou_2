@@ -91,6 +91,9 @@ export default function Home() {
   const [claimable, setClaimable] = useState<{ roundId: number; tier: number; amount: bigint; deadline: bigint }[]>([]);
   // 结算时按配比释放，原始 pot 与实际可分配额在大额滚存 + 低参与度时可差数量级
   const [distributable, setDistributable] = useState<bigint>(0n);
+  // FR-C-30：触发开奖可得的奖励，以及本账户已记账未领取的部分
+  const [drawReward, setDrawReward] = useState<bigint>(0n);
+  const [myKeeperReward, setMyKeeperReward] = useState<bigint>(0n);
   const [salesOpen, setSalesOpen] = useState(true);
   const [feeBps, setFeeBps] = useState<number>(0);
   const [treasuryAddr, setTreasuryAddr] = useState<Address | null>(null);
@@ -265,6 +268,26 @@ export default function Home() {
           functionName: "salesOpenFor",
           args: [cur],
         })) as boolean,
+      );
+      // 合约里的 pendingKeeperReward 与实际发放用的是同一套算式，
+      // 因此界面上显示的数字就是真会拿到的数字（有测试钉住这一点）
+      setDrawReward(
+        (await publicClient.readContract({
+          address: addresses.lottery,
+          abi: lotteryAbi,
+          functionName: "pendingKeeperReward",
+          args: [cur],
+        })) as bigint,
+      );
+      setMyKeeperReward(
+        account
+          ? ((await publicClient.readContract({
+              address: addresses.lottery,
+              abi: lotteryAbi,
+              functionName: "keeperRewardOf",
+              args: [account],
+            })) as bigint)
+          : 0n,
       );
       // 票价是 immutable，共享模块只读一次（审计 E）
       await loadTokenMeta();
@@ -688,8 +711,22 @@ export default function Home() {
               disabled={busy !== null || !current || current.state !== 1 || chainNow < current.drawTime}
               onClick={() => act("触发开奖 performUpkeep", () => write(addresses.lottery, lotteryAbi, "performUpkeep", ["0x"]))}
             >
-              🎰 触发开奖{IS_LOCAL ? "（模拟 keeper）" : "（keeper 兜底）"}
+              🎰 触发开奖
+              {drawReward > 0n ? `（可得 ${fmt6(drawReward)}）` : IS_LOCAL ? "（模拟 keeper）" : ""}
             </button>
+            {myKeeperReward > 0n && (
+              <button
+                className="btn"
+                disabled={busy !== null}
+                onClick={() =>
+                  act(`领取开奖奖励 ${fmt6(myKeeperReward)}`, () =>
+                    write(addresses.lottery, lotteryAbi, "claimKeeperReward", []),
+                  )
+                }
+              >
+                💵 领取开奖奖励（{fmt6(myKeeperReward)}）
+              </button>
+            )}
             {IS_LOCAL &&
               drawingRounds.map((r) => (
                 <button

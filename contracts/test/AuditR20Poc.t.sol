@@ -135,7 +135,12 @@ contract AuditR20PocTest is LotteryTestBase {
         // 退完之后该期账面归零，合约里只剩抽成——没有任何钱被困住
         (,,,, uint256 potAfter,,,,) = lottery.getRound(1);
         assertEq(potAfter, 0, "nothing left trapped in the abandoned round");
-        assertEq(address(lottery).balance, lottery.s_accruedFees(), "only fees remain");
+        // 抽成现在分处两个桶：s_accruedFees 与已记账未领的开奖奖励（FR-C-30）
+        assertEq(
+            address(lottery).balance,
+            lottery.s_accruedFees() + lottery.s_pendingKeeperRewards(),
+            "only fees (incl. accrued keeper rewards) remain"
+        );
     }
 
     // ===== M-1：不能接收原生币的合约钱包，中奖后奖金永久领不出来 =====

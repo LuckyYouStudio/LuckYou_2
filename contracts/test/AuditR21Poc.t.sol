@@ -613,7 +613,10 @@ contract AuditR21PocTest is LotteryTestBase {
     /// @dev 全部在库债务：抽成 + 缓冲区 + 未开奖期的 pot/tier1 + 已结算期的未领奖金。
     ///      与 LotteryInvariant 的口径一致，用于单点校验偿付性恒等式。
     function _obligations() internal view returns (uint256 total) {
-        total = lottery.s_accruedFees() + lottery.s_pendingPot() + lottery.s_pendingTier1();
+        // FR-C-30（2026-08-13 增）：已记账未领取的开奖奖励也是应付义务。
+        // 它是从 s_accruedFees 里挪出来的——漏掉这一项会把「换了口袋」误判成「资金泄漏」
+        total = lottery.s_accruedFees() + lottery.s_pendingPot() + lottery.s_pendingTier1()
+            + lottery.s_pendingKeeperRewards();
         uint32 cur = lottery.s_currentRound();
         for (uint32 id = 1; id <= cur; id++) {
             (Lottery.RoundState st,,,, uint256 pot, uint256 carry,, uint16 bits,) =

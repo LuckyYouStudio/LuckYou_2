@@ -77,10 +77,17 @@ contract LotteryOwnerTimingTest is LotteryTestBase {
         assertEq(lottery.s_accruedFees(), 1e14);
 
         _settleRound(1, 42); // 开出第 2 期，快照 5%
+        // 开奖同时按 FR-C-30 把第 1 期抽成的一部分划给了触发者，
+        // 因此下面的期望必须扣掉这笔——它没有消失，只是进了另一个桶
+        uint256 keeperCut = lottery.s_pendingKeeperRewards();
+        assertGt(keeperCut, 0, "sanity: the draw did pay a keeper reward");
+
         uint32 r = lottery.s_currentRound();
         _buy(bob, 100);
         // 第 2 期按 5% 计费：100 张票款 * 5%
-        assertEq(lottery.s_accruedFees(), 1e14 + 5e14, "new rate applies to the next round");
+        assertEq(
+            lottery.s_accruedFees(), 1e14 - keeperCut + 5e14, "new rate applies to the next round"
+        );
         assertEq(_potOf(r), 95e14);
     }
 }

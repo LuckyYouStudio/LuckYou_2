@@ -102,6 +102,7 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     error RoundNotAbandoned();
     error NotRangeOwner();
     error AlreadyRefunded();
+    error NoRewardToClaim();
 
     // ===== 事件（FR-C-25）=====
 
@@ -144,6 +145,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     event RoundAbandoned(uint32 indexed roundId, uint256 carryReturned);
     /// @notice 作废期的购票者取回票款
     event TicketsRefunded(uint32 indexed roundId, address indexed buyer, uint256 amount);
+    /// @notice 触发开奖者获得的奖励（FR-C-30）。资金来自**该期自己的**运营抽成，
+    ///         不动奖池分文——奖池与抽成自购票起就是分账的（FR-C-20）
+    event KeeperRewarded(uint32 indexed roundId, address indexed keeper, uint256 amount);
+    event KeeperRewardClaimed(address indexed keeper, uint256 amount);
 
     // ===== 常量 =====
 
@@ -175,6 +180,21 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     ///         任何人可作废该期，购票者按票款原路取回。
     ///         **不含任何自由裁量权**，因此不违反 FR-C-24（该条禁的是「管理员能动到未领奖金」）
     uint64 public constant ABANDON_TIMEOUT = 30 days;
+    /// @notice 触发开奖的奖励占**该期抽成**的比例（FR-C-30）。
+    ///
+    ///         为什么是常量而非可调参数：多一个可调项就多一个信任面，而这个数
+    ///         本就不该经常动。代价是部署后无法适应 gas 或币价的长期变化——
+    ///         真要改只能重新部署，这是刻意接受的取舍。
+    ///
+    ///         为什么按比例而非固定金额：固定金额在 ETH 涨跌与 gas 波动下迟早失衡；
+    ///         按比例则自动缩放——热闹的期奖励高、冷清的期奖励低、**零票的期为零**。
+    ///
+    ///         经济上的诚实说明：一次 performUpkeep 约 17.3 万 gas，主网连同 L1
+    ///         数据费约 1e-5 ETH。20% 意味着约 50 张票以上的期才够覆盖 gas，
+    ///         更小的期不会有人来按按钮。这不是缺陷——三张票的期本就不值得
+    ///         谁专门跑机器人；但它意味着**奖励创造的是动机，不是机制**，
+    ///         冷启动阶段仍需运营方自己触发
+    uint16 public constant KEEPER_REWARD_BPS = 2000; // 20%
     uint16 public constant BPS_DENOMINATOR = 10000;
     uint16 private constant VRF_CONFIRMATIONS = 3;
     uint32 private constant VRF_CALLBACK_GAS = 1_000_000;
@@ -221,6 +241,12 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     /// @dev 作废期中已退款的 Range（FR-C-29）。按 range 而非按地址记账：
     ///      同一地址可能有多条 Range，逐条标记才能既支持分批退款又杜绝重复领取
     mapping(uint32 roundId => mapping(uint256 rangeIndex => bool)) private s_rangeRefunded;
+
+    /// @dev 已记账、尚未领取的开奖奖励（pull 模式，FR-C-30）
+    mapping(address keeper => uint256 amount) private s_keeperRewards;
+    /// @dev 上面那个 mapping 的总和。mapping 无法在链上求和，而偿付性不变量
+    ///      必须把这笔未领奖励计入应付义务，故单独维护一个聚合数
+    uint256 public s_pendingKeeperRewards;
 
     // ===== 构造 =====
 
@@ -381,6 +407,10 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
 
         r.state = RoundState.DRAWING;
         r.drawRequestedAt = uint64(block.timestamp);
+        // FR-C-30：给触发者记账奖励。**只在这条分支**——零票作废的期不给，
+        // 否则无人玩时有人可以每个间隔触发一次 VOID 来刷钱。
+        // （按比例算本就会得 0，此处仍显式区分，让意图写在代码结构里而非注释里）
+        _accrueKeeperReward(roundId, r);
         // VRF 请求失败**不得**让整笔交易回滚：否则订阅被 removeConsumer 或 coordinator
         // 层失效时，_openNextRound 也一起失败 → 期号永不推进 → 全部资金（含缓冲区）
         // 永久冻结，而 FR-C-24 禁止任何救援手段。隔离后最坏只是本期卡在 DRAWING
@@ -630,6 +660,34 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
         return s_rangeRefunded[roundId][rangeIndex];
     }
 
+    /// @notice 领取累计的开奖奖励（pull 模式，FR-C-30）
+    function claimKeeperReward() external nonReentrant {
+        uint256 amount = s_keeperRewards[msg.sender];
+        if (amount == 0) revert NoRewardToClaim();
+        s_keeperRewards[msg.sender] = 0;
+        s_pendingKeeperRewards -= amount;
+        emit KeeperRewardClaimed(msg.sender, amount);
+        _sendValue(msg.sender, amount);
+    }
+
+    /// @notice 某地址已记账、尚未领取的开奖奖励
+    function keeperRewardOf(address keeper) external view returns (uint256) {
+        return s_keeperRewards[keeper];
+    }
+
+    /// @notice 现在触发某期开奖能拿到多少奖励（前端用于在按钮上展示）。
+    /// @dev 与 `_accrueKeeperReward` 完全同一套算式；该期若不可开奖或零票则为 0
+    function pendingKeeperReward(uint32 roundId) external view returns (uint256) {
+        Round storage r = s_rounds[roundId];
+        if (r.state != RoundState.OPEN || r.ticketCount == 0) return 0;
+        if (block.timestamp < uint256(r.closeTime) + SEAL_GAP) return 0;
+        uint256 gross = uint256(r.ticketCount) * i_ticketPrice;
+        uint256 reward = ((gross - (r.pot - r.carriedPot)) * KEEPER_REWARD_BPS) / BPS_DENOMINATOR;
+        if (reward > i_ticketPrice) reward = i_ticketPrice;
+        if (reward > s_accruedFees) reward = s_accruedFees;
+        return reward;
+    }
+
     /// @notice 把已分账的运营抽成全额转给 treasury。任何人可触发，资金只会去 treasury
     function withdrawFees() external nonReentrant {
         uint256 amount = s_accruedFees;
@@ -852,6 +910,40 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     }
 
     // ===== 内部 =====
+
+    /// @dev 给 performUpkeep 的调用者记账奖励（FR-C-30，pull 模式）。
+    ///
+    ///      **为什么必须是 pull 而不是当场转账**：performUpkeep 内部有
+    ///      `try this.requestRandomWordsSelf()` 这个外部自调用，直接加 nonReentrant
+    ///      会把自己挡在门外；而在函数中途给任意调用者转原生币则直接开了重入口子
+    ///      （原生转账会执行接收方代码）。记账 + 另行领取一次解决两个问题，
+    ///      也与 claim 的 pull 哲学一致（FR-C-17）。
+    ///
+    ///      **资金来源是该期自己的抽成，不动奖池分文**（FR-C-20 的分账仍然成立）。
+    ///      三道夹逼缺一不可：
+    ///        1. 按该期抽成的比例——而非历史累计。否则一个 1 张票的小期能把
+    ///           之前大期赚的钱吸走
+    ///        2. 上限一张票价——防止巨额期把抽成大比例送出去
+    ///        3. 不超过实际尚存的 accruedFees——抽成可能已被 withdrawFees 提走，
+    ///           不夹这一下会下溢
+    function _accrueKeeperReward(uint32 roundId, Round storage r) private {
+        // 该期抽成 = 票款总额 − 自售净额。两个数都已在链上，且与购票时
+        // 「pot += cost - fee」逐笔对应，因此这个减法是精确的，无需新增存储。
+        // 注资只进 pot 也只进 carriedPot，在差值里自动抵消，不会被误算成抽成
+        uint256 gross = uint256(r.ticketCount) * i_ticketPrice;
+        uint256 selfSold = r.pot - r.carriedPot; // carriedPot <= pot 恒成立
+        uint256 reward = ((gross - selfSold) * KEEPER_REWARD_BPS) / BPS_DENOMINATOR;
+
+        if (reward > i_ticketPrice) reward = i_ticketPrice;
+        uint256 available = s_accruedFees;
+        if (reward > available) reward = available;
+        if (reward == 0) return;
+
+        s_accruedFees -= reward;
+        s_keeperRewards[msg.sender] += reward;
+        s_pendingKeeperRewards += reward;
+        emit KeeperRewarded(roundId, msg.sender, reward);
+    }
 
     /// @dev 按自售额配比扣留超额 carry（FR-C-27）：本期可分配的滚存/注资上限 =
     ///      自售净额 × CARRY_MATCH_MULTIPLIER，超出部分退回缓冲顺延。
