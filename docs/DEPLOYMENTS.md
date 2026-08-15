@@ -16,18 +16,18 @@
 
 ## Base Sepolia（chainId 84532）
 
-### 当前实例（2026-08-14，含第 50 轮全部修复）
+### 当前实例（2026-08-15，冻结候选）
 
 | | |
 |---|---|
-| **Lottery** | `0x89412E2f96b90f8FFFf52e3f6749b5BbA7cE731c` |
-| **LotteryAdmin** | `0x9286d564901560Ae1926457df824B188158F878C` |
-| **CRE 桥接器** | `0x4f073D1C95CE471e698E5c648fA6f95244427df6` |
-| **commit** | `d994d66572925d2e16e5f2b8b41ac2d725e4372b` |
-| **anchorTime** | **`1786760860`** |
-| 含有 | 原生 ETH、claimTo、Q9 方案 B+C、FR-C-30 开奖激励、**第 50 轮 A-1~A-4** |
+| **Lottery** | `0x7e88f1Ef79cA08d07f992DB33146eC134130E92B` |
+| **LotteryAdmin** | `0x957235d951c9abC5E8e7fBBcA285A5D1Ff52e56f` |
+| **CRE 桥接器** | `0x940d69Df2BACa8030322B12660EAd5D0379bfdB0` |
+| **commit** | `5a2069a` |
+| **anchorTime** | **`1786762780`** |
+| 含有 | 原生 ETH、claimTo、Q9 B+C、FR-C-30、第 50 轮 A-1~A-4、**R20 L-1 + R21 C-1** |
 | Basescan | 三个合约均已验证 |
-| 链上实测 | A-1 提费预留生效（抽成 1e14 / 可提 8e13 / 提后预留 2e13）；A-2 `refundAbandonedTo`、A-3 `claimKeeperRewardTo` 均返回 `InvalidRecipient`（旧版为函数不存在的空 revert）；`owner()` = LotteryAdmin |
+| 链上实测 | `buyTickets(uint32,uint32)` 传错期号返回 `RoundMismatch`（选择器 `0xb6188a5a` 精确匹配）；**旧的单参签名已不存在**（调用直接 revert） |
 
 其余构造参数同下表（coordinator / keyHash / ticketPrice / intervals / treasury / feeBps / tierBps / tierWinnerCounts 未变）。
 
@@ -35,10 +35,14 @@
 > 只改 `config.production.json` 的 `receiverAddress` 改不到链上那个值，
 > 会得到一个「配置看起来对、链上指向错」的静默失效状态（2026-08-14 实际踩到）。
 
+> ⚠️ **`buyTickets` 签名在 `5a2069a` 变了**（FR-C-09a）。前端/脚本对着旧实例用新 ABI，
+> 或对着新实例用旧 ABI，都会直接 revert 而非静默出错——这是刻意的，但换实例时要记得同步 ABI。
+
 ### 历史实例（已弃用，勿再使用）
 
 | 地址 | commit | 说明 |
 |---|---|---|
+| `0x89412E2f96b90f8FFFf52e3f6749b5BbA7cE731c` | `d994d66` | anchor `1786760860`。含 R50 四条修复，不含 L-1/C-1。第 1 期有 100 张票、13:42 开奖，可用 cast 手动触发以采集完整周期数据 |
 | `0x95b008Bc0B1969301a6d08828008aA66bC448627` | `d6b9447` | anchor `1786628468`。含 B+C，不含 FR-C-30 |
 | `0x66F5a2dc4f14A76D9B29D154D59efA62b1274AaA` | `bb9cb71` | anchor `1786628468`。含 R20 修复，钉死方案尚未移除 |
 | `0x229500a0E5102275E7729d84bff0F5b3CAB350F9` | — | 首个原生 ETH 版 |
