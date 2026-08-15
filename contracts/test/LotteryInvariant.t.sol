@@ -56,8 +56,9 @@ contract LotteryHandler is Test {
         }
         uint256 cost = uint256(qty) * 1e14;
         vm.deal(actor, actor.balance + (cost));
+        uint32 _rid1 = lottery.s_currentRound();
         vm.startPrank(actor);
-        lottery.buyTickets{value: cost}(qty);
+        lottery.buyTickets{value: cost}(qty, _rid1);
         vm.stopPrank();
         totalBought += cost;
     }
@@ -164,8 +165,9 @@ contract LotteryHandler is Test {
         uint256 cost = uint256(qty) * 1e14;
         address actor = actors[0];
         vm.deal(actor, actor.balance + cost);
+        uint32 _rid2 = lottery.s_currentRound();
         vm.prank(actor);
-        lottery.buyTickets{value: cost}(qty);
+        lottery.buyTickets{value: cost}(qty, _rid2);
         totalBought += cost;
 
         // 让 VRF 请求失败 → 该期停在 DRAWING 且 requestId 为 0，fulfillPending 救不了它

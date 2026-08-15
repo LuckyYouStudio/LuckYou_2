@@ -14,7 +14,8 @@ contract WindowSniper {
 
     function snipe(uint32 qty, uint256 price) external {
         lottery.performUpkeep("");
-        lottery.buyTickets{value: price * qty}(qty);
+        uint32 _rid1 = lottery.s_currentRound();
+        lottery.buyTickets{value: price * qty}(qty, _rid1);
     }
 
     receive() external payable {}
@@ -32,8 +33,9 @@ contract LotteryFieldControlTest is LotteryTestBase {
 
         // 其他人照常可买本期——owner 无法把场子清空给自己
         vm.deal(bob, bob.balance + (8e14));
+        uint32 _rid2 = lottery.s_currentRound();
         vm.startPrank(bob);
-        lottery.buyTickets{value: PRICE * 8}(8); // 不 revert
+        lottery.buyTickets{value: PRICE * 8}(8, _rid2); // 不 revert
         vm.stopPrank();
         assertEq(lottery.ticketsOwned(1, bob), 8);
     }
@@ -48,16 +50,18 @@ contract LotteryFieldControlTest is LotteryTestBase {
 
         // 其他人买不了
         vm.deal(bob, bob.balance + (8e14));
+        uint32 _rid3 = lottery.s_currentRound();
         vm.startPrank(bob);
         vm.expectRevert(Lottery.SalesArePaused.selector);
-        lottery.buyTickets{value: PRICE * 8}(8);
+        lottery.buyTickets{value: PRICE * 8}(8, _rid3);
         vm.stopPrank();
 
         // owner 解禁后自己也买不了这一期（快照已定死），无法独占
         lottery.setSalesPaused(false);
         vm.deal(address(this), address(this).balance + (8e14));
+        uint32 _rid4 = lottery.s_currentRound();
         vm.expectRevert(Lottery.SalesArePaused.selector);
-        lottery.buyTickets{value: PRICE * 8}(8);
+        lottery.buyTickets{value: PRICE * 8}(8, _rid4);
     }
 
     /// @dev #2 核心回归：新期售票窗口不得短于 MIN_SALES_WINDOW，无法被择时压缩。
@@ -87,8 +91,9 @@ contract LotteryFieldControlTest is LotteryTestBase {
         // 其他人仍有充足时间进场
         vm.warp(block.timestamp + 10 minutes);
         vm.deal(bob, bob.balance + (8e14));
+        uint32 _rid5 = lottery.s_currentRound();
         vm.startPrank(bob);
-        lottery.buyTickets{value: PRICE * 8}(8); // 不 revert
+        lottery.buyTickets{value: PRICE * 8}(8, _rid5); // 不 revert
         vm.stopPrank();
     }
 

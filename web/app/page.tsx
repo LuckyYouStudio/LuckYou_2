@@ -705,7 +705,16 @@ export default function Home() {
               }
               onClick={() =>
                 act(`购买 ${qty} 张`, () =>
-                  write(addresses.lottery, lotteryAbi, "buyTickets", [parseInt(qty, 10)], cost),
+                  // 第二个参数必须是**界面此刻显示给用户的**期号（currentId），
+                  // 绝不能在这里重新读一次链。整条防线的意义就在于「下单时看到的」与
+                  // 「链上成交时的」不一致就拒绝成交；现读会让两者恒等，防线变成摆设
+                  write(
+                    addresses.lottery,
+                    lotteryAbi,
+                    "buyTickets",
+                    [parseInt(qty, 10), currentId],
+                    cost,
+                  ),
                 )
               }
             >

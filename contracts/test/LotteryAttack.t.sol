@@ -21,7 +21,8 @@ contract ReentrantWinner {
     }
 
     function buy(uint32 qty, uint256 price) external {
-        lottery.buyTickets{value: price * qty}(qty);
+        uint32 _rid1 = lottery.s_currentRound();
+        lottery.buyTickets{value: price * qty}(qty, _rid1);
     }
 
     function attack(uint32 roundId, uint8 tier) external {
@@ -50,7 +51,8 @@ contract RejectingReceiver {
     }
 
     function buy(uint32 qty, uint256 price) external {
-        lottery.buyTickets{value: price * qty}(qty);
+        uint32 _rid2 = lottery.s_currentRound();
+        lottery.buyTickets{value: price * qty}(qty, _rid2);
     }
 
     function claim(uint32 roundId, uint8 tier) external {
@@ -99,11 +101,13 @@ contract LotteryAttackTest is LotteryTestBase {
     /// @dev 多付/少付都必须 revert，合约不自动退差额（FR-C-03）
     function test_Attack_IncorrectPaymentRejected() public {
         vm.deal(alice, 100 * PRICE);
+        uint32 _rid3 = lottery.s_currentRound();
         vm.startPrank(alice);
         vm.expectRevert(Lottery.IncorrectPayment.selector);
-        lottery.buyTickets{value: PRICE * 10 + 1}(10); // 多付 1 wei
+        lottery.buyTickets{value: PRICE * 10 + 1}(10, _rid3); // 多付 1 wei
+        uint32 _rid4 = lottery.s_currentRound();
         vm.expectRevert(Lottery.IncorrectPayment.selector);
-        lottery.buyTickets{value: PRICE * 10 - 1}(10); // 少付 1 wei
+        lottery.buyTickets{value: PRICE * 10 - 1}(10, _rid4); // 少付 1 wei
         vm.stopPrank();
         assertEq(address(lottery).balance, 0, "no funds accepted");
     }
@@ -113,11 +117,13 @@ contract LotteryAttackTest is LotteryTestBase {
         vm.deal(alice, alice.balance + (2e14));
         vm.startPrank(alice);
         vm.warp(_closeTimeOf(1) - 1);
-        lottery.buyTickets{value: PRICE * 1}(1); // 边界前一秒：允许
+        uint32 _rid5 = lottery.s_currentRound();
+        lottery.buyTickets{value: PRICE * 1}(1, _rid5); // 边界前一秒：允许
 
         vm.warp(_closeTimeOf(1));
+        uint32 _rid6 = lottery.s_currentRound();
         vm.expectRevert(Lottery.SalesClosed.selector);
-        lottery.buyTickets{value: PRICE * 1}(1); // 到达停售时刻：拒绝（即使 keeper 未执行）
+        lottery.buyTickets{value: PRICE * 1}(1, _rid6); // 到达停售时刻：拒绝（即使 keeper 未执行）
         vm.stopPrank();
     }
 

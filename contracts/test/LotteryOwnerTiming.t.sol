@@ -62,8 +62,9 @@ contract LotteryOwnerTimingTest is LotteryTestBase {
 
         // 受害者购票：仍按开期时的 1% 计费
         vm.deal(bob, bob.balance + (1000e14));
+        uint32 _rid1 = lottery.s_currentRound();
         vm.startPrank(bob);
-        lottery.buyTickets{value: PRICE * 1000}(1000);
+        lottery.buyTickets{value: PRICE * 1000}(1000, _rid1);
         vm.stopPrank();
 
         assertEq(lottery.s_accruedFees(), 10e14, "fee charged at the rate snapshotted at open");

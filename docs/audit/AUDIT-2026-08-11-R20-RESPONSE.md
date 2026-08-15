@@ -12,7 +12,7 @@
 | **M-1** | 非 payable 合约钱包中奖即弃奖 | ✅ 属实 | **加 `claimTo`** |
 | **M-2** | owner 私钥失窃 ⇒ 不可恢复冻结 | ✅ 属实，与 H-1 同源 | 同 H-1，并入 Q9 |
 | **M-3** | 卡死的期没有自动兜底 | ✅ 属实 | **已闭环**（自托管 keeper 每 10 分钟扫一次并 `retryDraw`）；CRE 侧仍待迁移 |
-| L-1 | `buyTickets` 缺 roundId 闸 | ✅ 属实 | 需改函数签名 = SPEC 变更，**留待决策** |
+| L-1 | `buyTickets` 缺 roundId 闸 | ✅ 属实 | **已修复（2026-08-15）**：签名改为 `buyTickets(quantity, expectedRoundId)`，见 SPEC FR-C-09a |
 | L-2 | `CLAIM_SCAN_ROUNDS` 算错 9 倍 | ✅ 属实 | **改为按链上实测节奏推导** |
 | L-3 | history 页扫描随链长线性增长 | ✅ 属实，**且比报告说的更严重** | **已修**，详见下文 |
 | L-4 | 远古 anchorTime 让部署 OOG | ✅ 属实 | **加构造器闸** |

@@ -75,6 +75,8 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     error SalesClosed();
     error SalesArePaused();
     error InvalidQuantity();
+    /// @notice 调用者指定的期号与链上当前期不符（FR-C-09a）
+    error RoundMismatch(uint32 expected, uint32 actual);
     error ExceedsMaxPerTx();
     error ExceedsRoundCapacity();
     error TicketOutOfRange();
@@ -327,10 +329,20 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     // ===== 购票与注资 =====
 
     /// @notice 购买连续票号的彩票，一次购买只写入一条 Range（FR-C-04）。
+    /// @param quantity 购买张数
+    /// @param expectedRoundId 调用者**发起交易时看到的**期号；与链上当前期不符即 revert（FR-C-09a）
     /// @dev msg.value **必须恰好**等于 票价 × 张数：多付不自动退还——退款是额外的
     ///      外部调用，会平白扩大重入面（FR-C-03）
-    function buyTickets(uint32 quantity) external payable {
+    /// @dev 为什么期号必须由调用者带进来（R20 L-1）：交易在内存池里排队期间，
+    ///      `performUpkeep` 可能已经翻到下一期。此时买单会落在一个用户从未选择的期上——
+    ///      奖池规模、已售票数、中奖概率、乃至距停售还剩多久，全都与他下单时看到的不同。
+    ///      钱不会丢，但「买到的不是看到的」在彩票语境下就是错误成交。
+    ///      **注意**：`expectedRoundId` 必须来自链下（用户下单那一刻的读数）。
+    ///      在同一笔交易里现读 `s_currentRound()` 再传进来是**完全无效的**——
+    ///      那只是把当前值和它自己比，恒等成立。
+    function buyTickets(uint32 quantity, uint32 expectedRoundId) external payable {
         uint32 roundId = s_currentRound;
+        if (roundId != expectedRoundId) revert RoundMismatch(expectedRoundId, roundId);
         Round storage r = s_rounds[roundId];
         // 用开期快照而非全局标志：暂停对「已开出的期」无效，owner 无法中途清场后自购
         if (r.salesPausedAtOpen) revert SalesArePaused();
@@ -361,6 +373,12 @@ contract Lottery is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Reentr
     /// @dev 与 buyTickets 共用同一时间闸（FR-C-09）：停售后不得再改变本期奖池规模
     function injectPot(uint32 roundId) external payable {
         Round storage r = s_rounds[roundId];
+        // 与 buyTickets 共用同一道暂停闸（R21 C-1）。这不是语义洁癖：暂停状态在开期时
+        // 就被快照定死，因此「开期即暂停」的期**永远不可能有票**（buyTickets 恒 revert，
+        // 事后恢复售票也改不了这一期的快照），必然以 ticketCount == 0 走到 VOIDED。
+        // 往这样的期注资，那笔钱**必然**流进滚存缓冲区——而缓冲区没有退出通道（FR-C-28）。
+        // 也就是说，缺了这道闸，injectPot 就是一条把资金单向送进黑洞的合法入口
+        if (r.salesPausedAtOpen) revert SalesArePaused();
         if (r.state != RoundState.OPEN) revert RoundNotOpen();
         if (block.timestamp >= r.closeTime) revert SalesClosed();
         uint256 amount = msg.value;

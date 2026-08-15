@@ -93,8 +93,9 @@ contract LotteryPriceParityTest is LotteryTestBase {
         for (uint256 i = 0; i < 3; i++) {
             uint256 cost = price * qtys[i];
             vm.deal(users[i], users[i].balance + cost);
+            uint32 _rid1 = l.s_currentRound();
             vm.prank(users[i]);
-            l.buyTickets{value: cost}(qtys[i]);
+            l.buyTickets{value: cost}(qtys[i], _rid1);
         }
         vm.warp(ANCHOR + 2 days + 75 minutes);
         l.performUpkeep("");

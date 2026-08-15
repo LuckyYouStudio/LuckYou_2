@@ -103,8 +103,9 @@ contract LotteryCarryFuzzTest is LotteryTestBase {
 
         // 无论中途怎么切换，本期始终可购
         vm.deal(bob, bob.balance + (uint256(qty) * PRICE));
+        uint32 _rid1 = lottery.s_currentRound();
         vm.startPrank(bob);
-        lottery.buyTickets{value: PRICE * qty}(qty);
+        lottery.buyTickets{value: PRICE * qty}(qty, _rid1);
         vm.stopPrank();
         assertEq(lottery.ticketsOwned(1, bob), qty);
         assertEq(lottery.salesOpenFor(1), openable, "snapshot never changes mid-round");

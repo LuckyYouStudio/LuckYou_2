@@ -71,8 +71,9 @@ contract LotteryTestBase is Test {
     function _buy(address user, uint32 qty) internal {
         uint256 cost = PRICE * qty;
         vm.deal(user, user.balance + cost);
+        uint32 _rid1 = lottery.s_currentRound();
         vm.prank(user);
-        lottery.buyTickets{value: cost}(qty);
+        lottery.buyTickets{value: cost}(qty, _rid1);
     }
 
     /// @dev 原生币注资
@@ -231,9 +232,10 @@ contract LotteryBuyTest is LotteryTestBase {
     function test_RevertWhen_BuyAtOrAfterCloseTime() public {
         vm.warp(_closeTimeOf(1)); // FR-C-09：即使 keeper 未触发也拒绝
         vm.deal(alice, alice.balance + (PRICE));
+        uint32 _rid2 = lottery.s_currentRound();
         vm.startPrank(alice);
         vm.expectRevert(Lottery.SalesClosed.selector);
-        lottery.buyTickets{value: PRICE * 1}(1);
+        lottery.buyTickets{value: PRICE * 1}(1, _rid2);
         vm.stopPrank();
     }
 
@@ -245,19 +247,22 @@ contract LotteryBuyTest is LotteryTestBase {
         _settleRound(1, 42); // 开出第 2 期时快照 paused=true
 
         vm.deal(bob, bob.balance + (PRICE));
+        uint32 _rid3 = lottery.s_currentRound();
         vm.startPrank(bob);
         vm.expectRevert(Lottery.SalesArePaused.selector);
-        lottery.buyTickets{value: PRICE * 1}(1);
+        lottery.buyTickets{value: PRICE * 1}(1, _rid3);
         vm.stopPrank();
     }
 
     function test_RevertWhen_BuyZeroOrOverMax() public {
         vm.deal(alice, alice.balance + (PRICE * 2000));
+        uint32 _rid4 = lottery.s_currentRound();
         vm.startPrank(alice);
         vm.expectRevert(Lottery.InvalidQuantity.selector);
-        lottery.buyTickets{value: PRICE * 0}(0);
+        lottery.buyTickets{value: PRICE * 0}(0, _rid4);
+        uint32 _rid5 = lottery.s_currentRound();
         vm.expectRevert(Lottery.ExceedsMaxPerTx.selector);
-        lottery.buyTickets{value: PRICE * 1001}(1001); // FR-C-06
+        lottery.buyTickets{value: PRICE * 1001}(1001, _rid5); // FR-C-06
         vm.stopPrank();
     }
 
@@ -268,10 +273,12 @@ contract LotteryBuyTest is LotteryTestBase {
         vm.deal(alice, alice.balance + (PRICE * 110));
         vm.startPrank(alice);
         uint256 g0 = gasleft();
-        lottery.buyTickets{value: PRICE * 10}(10);
+        uint32 _rid6 = lottery.s_currentRound();
+        lottery.buyTickets{value: PRICE * 10}(10, _rid6);
         uint256 gas10 = g0 - gasleft();
         g0 = gasleft();
-        lottery.buyTickets{value: PRICE * 100}(100);
+        uint32 _rid7 = lottery.s_currentRound();
+        lottery.buyTickets{value: PRICE * 100}(100, _rid7);
         uint256 gas100 = g0 - gasleft();
         vm.stopPrank();
 
@@ -654,8 +661,9 @@ contract LotteryPriceScaleTest is LotteryTestBase {
 
     function test_LargeTicketPriceAccountingAndClaim() public {
         vm.deal(alice, 100 ether);
+        uint32 _rid8 = lottery.s_currentRound();
         vm.prank(alice);
-        lottery.buyTickets{value: BIG_PRICE * 100}(100);
+        lottery.buyTickets{value: BIG_PRICE * 100}(100, _rid8);
 
         assertEq(_potOf(1), 99 ether, "pot = 99% of 100 ETH");
         assertEq(lottery.s_accruedFees(), 1 ether, "fee = 1%");

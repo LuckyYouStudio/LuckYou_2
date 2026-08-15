@@ -54,7 +54,8 @@ contract Interact is Script {
         Lottery lottery = _lottery();
         uint256 cost = lottery.i_ticketPrice() * quantity;
         vm.startBroadcast();
-        lottery.buyTickets{value: cost}(quantity);
+        uint32 _rid1 = lottery.s_currentRound();
+        lottery.buyTickets{value: cost}(quantity, _rid1);
         vm.stopBroadcast();
         console.log(unicode"已购票（张）:", quantity);
         console.log(unicode"支付（wei）:", cost);

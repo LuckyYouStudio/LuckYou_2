@@ -14,7 +14,8 @@ contract NonPayableBuyer {
     }
 
     function buy(uint32 qty, uint256 price) external {
-        i_lottery.buyTickets{value: price * qty}(qty);
+        uint32 _rid1 = i_lottery.s_currentRound();
+        i_lottery.buyTickets{value: price * qty}(qty, _rid1);
     }
 
     function refund(uint32 roundId, uint256 idx) external {

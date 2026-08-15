@@ -39,7 +39,8 @@ contract ClaimToReenterer {
     }
 
     function buy(uint32 qty) external payable {
-        i_lottery.buyTickets{value: msg.value}(qty);
+        uint32 _rid1 = i_lottery.s_currentRound();
+        i_lottery.buyTickets{value: msg.value}(qty, _rid1);
     }
 
     function attack(uint32 roundId) external {
@@ -73,7 +74,8 @@ contract ClaimToReenterer {
         }
 
         // ② 未加守卫的入口：逐一试，记录哪些真的能在回调里跑通
-        try i_lottery.buyTickets{value: i_lottery.i_ticketPrice()}(1) {
+        uint32 _rid2 = i_lottery.s_currentRound();
+        try i_lottery.buyTickets{value: i_lottery.i_ticketPrice()}(1, _rid2) {
             buyOk = true;
         } catch {}
         try i_lottery.injectPot{value: 1}(i_lottery.s_currentRound()) {
@@ -364,7 +366,12 @@ contract AuditR21PocTest is LotteryTestBase {
     ///      的期注资；这笔钱随后在「VOID -> 缓冲 -> 新期（同样被暂停）-> VOID」之间
     ///      无限循环，只要暂停不解除就没有任何人能碰到它。钱不会丢，但注资人
     ///      得不到任何对价，而 FR-C-26 明确「注入只进不出」。这是一个真实的不对称。
-    function test_Poc_InjectPotIgnoresTheSalesPauseSnapshot() public {
+    /// @dev R21 C-1 已修复（2026-08-15）。原 PoC 断言的是修复**前**的坏行为：
+    ///      暂停期照收注资。此处改为钉住修复后的性质，并保留当初判定它值得修的证据链——
+    ///      暂停快照在开期时定死，被暂停的期**永远不可能有票**（事后恢复也改不了本期快照），
+    ///      必然零票 VOID，因此注进去的钱必然落入滚存缓冲区，而缓冲区没有退出通道
+    ///      （FR-C-28）。缺了这道闸，injectPot 就是一条把资金单向送进黑洞的合法入口。
+    function test_Fix_InjectPotHonorsTheSalesPauseSnapshot() public {
         // 让下一期在"已暂停"状态下开出
         lottery.setSalesPaused(true);
         _buy(alice, 1); // 第 1 期是暂停生效前开出的，仍可购票
@@ -375,24 +382,33 @@ contract AuditR21PocTest is LotteryTestBase {
 
         // 购票被拒
         vm.deal(bob, bob.balance + PRICE);
+        uint32 _rid3 = lottery.s_currentRound();
         vm.prank(bob);
         vm.expectRevert(Lottery.SalesArePaused.selector);
-        lottery.buyTickets{value: PRICE}(1);
+        lottery.buyTickets{value: PRICE}(1, _rid3);
 
-        // 但注资照收不误
-        _inject(carol, paused, 5 ether);
-        assertGe(_potOf(paused), 5 ether, "the 5 ETH really landed in a round nobody can play");
+        // 修复点：注资也被同一道闸拒绝，钱根本进不来
+        uint256 potBefore = _potOf(paused);
+        vm.deal(carol, carol.balance + 5 ether);
+        vm.prank(carol);
+        vm.expectRevert(Lottery.SalesArePaused.selector);
+        lottery.injectPot{value: 5 ether}(paused);
+        assertEq(_potOf(paused), potBefore, "the paused round's pot is untouched");
 
-        // 该期必然零票 => VOID；钱经缓冲区立刻流进下一期，而下一期同样被暂停
-        for (uint256 i = 0; i < 3; i++) {
-            uint32 cur = lottery.s_currentRound();
-            _triggerDraw(cur);
-            assertEq(uint8(_stateOf(cur)), uint8(Lottery.RoundState.VOIDED));
-            uint32 next = lottery.s_currentRound();
-            assertFalse(lottery.salesOpenFor(next), "the successor round is paused too");
-            assertGe(_potOf(next), 5 ether, "the injection just moves to the next unplayable round");
-        }
-        assertEq(address(lottery).balance, _obligations(), "no funds lost, only stranded");
+        // 证据链：这一期确实必然零票 VOID —— 也就是说，钱只要进得来就一定被困住
+        _triggerDraw(paused);
+        assertEq(uint8(_stateOf(paused)), uint8(Lottery.RoundState.VOIDED));
+
+        // 反向守卫：别把闸开过头。恢复售票后新开的期必须照常接受注资
+        lottery.setSalesPaused(false);
+        uint32 stillPaused = lottery.s_currentRound(); // 它是暂停期间开出的，快照仍为 true
+        _triggerDraw(stillPaused);
+        uint32 live = lottery.s_currentRound();
+        assertTrue(lottery.salesOpenFor(live), "a round opened after unpausing sells normally");
+        _inject(carol, live, 5 ether);
+        assertGe(_potOf(live), 5 ether, "injection still works where it is actually playable");
+
+        assertEq(address(lottery).balance, _obligations(), "solvency holds");
     }
 
     // =====================================================================

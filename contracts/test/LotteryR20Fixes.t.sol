@@ -15,7 +15,8 @@ contract NonPayableWallet {
 
     // 只能靠外部先打钱进来才能买票——但它自己收不了款
     function buy(uint32 qty, uint256 value) external {
-        lottery.buyTickets{value: value}(qty);
+        uint32 _rid1 = lottery.s_currentRound();
+        lottery.buyTickets{value: value}(qty, _rid1);
     }
 
     function doClaim(uint32 roundId, uint8 tier) external {
@@ -139,5 +140,58 @@ contract LotteryR20FixesTest is LotteryTestBase {
             _tierWinners()
         );
         assertEq(ok.s_currentRound(), 1, "a 300-day-old anchor deploys fine");
+    }
+
+    // =====================================================================
+    // R20 L-1：buyTickets 必须由调用者带上期号（2026-08-15 修复）
+    // =====================================================================
+
+    /// @dev 这是这条修复要防的**真实场景**，不是抽象的参数校验：用户在第 1 期下单，
+    ///      交易还躺在内存池里时 `performUpkeep` 把期翻到了第 2 期。修复前这笔钱会
+    ///      静默买进第 2 期——奖池规模、已售票数、中奖概率、距停售还剩多久全都变了，
+    ///      买到的不是看到的。修复后直接 revert，钱退回用户手里由他重新决定。
+    function test_RevertWhen_RoundRolledOverWhileTxWasPending() public {
+        _buy(bob, 1); // 第 1 期已有别人买票，因此会走正常开奖而非零票 VOID
+        uint32 seen = lottery.s_currentRound(); // 用户下单那一刻看到的期号
+        assertEq(seen, 1);
+
+        // 交易排队期间，任何人都可以触发开奖把期推进（performUpkeep 无权限）
+        _settleRound(1, 7);
+        assertEq(lottery.s_currentRound(), 2, "the round advanced under the user's feet");
+
+        uint256 cost = PRICE * 3;
+        vm.deal(alice, alice.balance + cost);
+        uint256 balanceBefore = alice.balance;
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Lottery.RoundMismatch.selector, seen, uint32(2)));
+        lottery.buyTickets{value: cost}(3, seen);
+
+        // 钱一分没动，第 2 期也没有凭空多出票来
+        assertEq(alice.balance, balanceBefore, "the user's ETH never left");
+        (,,, uint32 tc2,,,,,) = lottery.getRound(2);
+        assertEq(tc2, 0, "nothing was bought into the round the user never chose");
+    }
+
+    /// @dev 反向守卫：期号相符时必须照常成交，别把闸开过头
+    function test_BuyWithMatchingRoundIdStillSucceeds() public {
+        uint32 seen = lottery.s_currentRound();
+        uint256 cost = PRICE * 3;
+        vm.deal(alice, alice.balance + cost);
+        vm.prank(alice);
+        lottery.buyTickets{value: cost}(3, seen);
+        (,,, uint32 tc,,,,,) = lottery.getRound(seen);
+        assertEq(tc, 3, "a matching round id buys normally");
+    }
+
+    /// @dev 未来期号同样必须拒绝。只挡「翻过头」是不够的——传入一个尚未开出的期号
+    ///      说明调用者的世界观本来就是错的，此时成交同样是错误成交
+    function test_RevertWhen_ExpectedRoundIdIsInTheFuture() public {
+        uint256 cost = PRICE;
+        vm.deal(alice, alice.balance + cost);
+        vm.prank(alice);
+        vm.expectRevert(
+            abi.encodeWithSelector(Lottery.RoundMismatch.selector, uint32(99), uint32(1))
+        );
+        lottery.buyTickets{value: cost}(1, 99);
     }
 }

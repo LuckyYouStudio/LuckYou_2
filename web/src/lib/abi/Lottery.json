@@ -213,6 +213,11 @@
         "name": "quantity",
         "type": "uint32",
         "internalType": "uint32"
+      },
+      {
+        "name": "expectedRoundId",
+        "type": "uint32",
+        "internalType": "uint32"
       }
     ],
     "outputs": [],
@@ -1757,6 +1762,22 @@
     "type": "error",
     "name": "RetryTooEarly",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "RoundMismatch",
+    "inputs": [
+      {
+        "name": "expected",
+        "type": "uint32",
+        "internalType": "uint32"
+      },
+      {
+        "name": "actual",
+        "type": "uint32",
+        "internalType": "uint32"
+      }
+    ]
   },
   {
     "type": "error",

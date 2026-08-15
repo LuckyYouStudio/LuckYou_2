@@ -19,7 +19,8 @@ contract NonPayableBuyer {
     }
 
     function buy(uint32 quantity) external payable {
-        i_lottery.buyTickets{value: msg.value}(quantity);
+        uint32 _rid1 = i_lottery.s_currentRound();
+        i_lottery.buyTickets{value: msg.value}(quantity, _rid1);
     }
 
     function claim(uint32 roundId, uint8 tier) external {
@@ -41,7 +42,8 @@ contract SoleBuyer {
         (,,, uint32 ticketCount,,,,,) = i_lottery.getRound(roundId);
         if (ticketCount != 0) revert NotSoleBuyer();
         for (uint32 i = 0; i < batches; i++) {
-            i_lottery.buyTickets{value: i_lottery.i_ticketPrice() * perBatch}(perBatch);
+            uint32 _rid2 = i_lottery.s_currentRound();
+            i_lottery.buyTickets{value: i_lottery.i_ticketPrice() * perBatch}(perBatch, _rid2);
         }
     }
 

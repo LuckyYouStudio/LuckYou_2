@@ -37,7 +37,8 @@ contract CrossFunctionReenterer {
     }
 
     function buy(uint32 qty) external {
-        lottery.buyTickets{value: lottery.i_ticketPrice() * qty}(qty);
+        uint32 _rid1 = lottery.s_currentRound();
+        lottery.buyTickets{value: lottery.i_ticketPrice() * qty}(qty, _rid1);
     }
 
     function doClaim(uint32 roundId, uint8 tier) external {
@@ -68,7 +69,8 @@ contract CrossFunctionReenterer {
             }
         } else if (w == keccak256("buy")) {
             uint256 price = lottery.i_ticketPrice();
-            try lottery.buyTickets{value: price}(1) {
+            uint32 _rid2 = lottery.s_currentRound();
+            try lottery.buyTickets{value: price}(1, _rid2) {
                 didRun = true;
             } catch (bytes memory e) {
                 innerError = e;
@@ -118,7 +120,8 @@ contract GasBurner {
     }
 
     function buy(uint32 qty) external {
-        lottery.buyTickets{value: lottery.i_ticketPrice() * qty}(qty);
+        uint32 _rid3 = lottery.s_currentRound();
+        lottery.buyTickets{value: lottery.i_ticketPrice() * qty}(qty, _rid3);
     }
 
     receive() external payable {
@@ -406,8 +409,9 @@ contract LotteryScaleAndBoundaryTest is LotteryTestBase {
         coordinator.addConsumer(subId, address(fastLottery));
 
         vm.deal(alice, alice.balance + PRICE);
+        uint32 _rid4 = fastLottery.s_currentRound();
         vm.prank(alice);
-        fastLottery.buyTickets{value: PRICE}(1);
+        fastLottery.buyTickets{value: PRICE}(1, _rid4);
 
         // 停摆一整年后才有人来触发
         vm.warp(block.timestamp + 365 days);
@@ -430,8 +434,9 @@ contract LotteryScaleAndBoundaryTest is LotteryTestBase {
         for (uint32 i = 0; i < n; i++) {
             address buyer = address(uint160(uint256(keccak256(abi.encode("grief", i)))));
             vm.deal(buyer, PRICE);
+            uint32 _rid5 = lottery.s_currentRound();
             vm.prank(buyer);
-            lottery.buyTickets{value: PRICE}(1);
+            lottery.buyTickets{value: PRICE}(1, _rid5);
         }
         assertEq(lottery.rangeCountOf(1), n);
         _settleRound(1, 42);
@@ -452,8 +457,9 @@ contract LotteryScaleAndBoundaryTest is LotteryTestBase {
         for (uint32 i = 0; i < n; i++) {
             address buyer = address(uint160(uint256(keccak256(abi.encode("grief", i)))));
             vm.deal(buyer, PRICE);
+            uint32 _rid6 = lottery.s_currentRound();
             vm.prank(buyer);
-            lottery.buyTickets{value: PRICE}(1);
+            lottery.buyTickets{value: PRICE}(1, _rid6);
         }
         uint256 gasBefore = gasleft();
         lottery.ticketsOwned(1, alice);
@@ -463,8 +469,9 @@ contract LotteryScaleAndBoundaryTest is LotteryTestBase {
 
         // 写入路径不受影响：仍可正常购票
         vm.deal(bob, bob.balance + PRICE);
+        uint32 _rid7 = lottery.s_currentRound();
         vm.prank(bob);
-        lottery.buyTickets{value: PRICE}(1);
+        lottery.buyTickets{value: PRICE}(1, _rid7);
         assertEq(lottery.rangeCountOf(1), n + 1, "writes unaffected by range count");
     }
 }

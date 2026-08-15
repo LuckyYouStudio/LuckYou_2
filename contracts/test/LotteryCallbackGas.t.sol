@@ -17,7 +17,8 @@ contract LotteryCallbackGasTest is LotteryTestBase {
         vm.deal(alice, alice.balance + (uint256(count) * PRICE));
         vm.startPrank(alice);
         for (uint32 i = 0; i < count; i++) {
-            lottery.buyTickets{value: PRICE * 1}(1);
+            uint32 _rid1 = lottery.s_currentRound();
+            lottery.buyTickets{value: PRICE * 1}(1, _rid1);
         }
         vm.stopPrank();
     }

@@ -137,6 +137,20 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
 - **FR-C-09** `buyTickets` 在 `state != OPEN` 或 `block.timestamp >= closeTime` 时
   **MUST** revert（即使 keeper 还没跑）
   - 理由：防止有人卡在截止边缘、已知即将开奖时下注
+- **FR-C-09a**（2026-08-15 增，R20 L-1）`buyTickets` **MUST** 接受调用者传入的
+  `expectedRoundId`，与 `s_currentRound` 不符即 revert `RoundMismatch(expected, actual)`。
+  - **理由**：交易在内存池排队期间，`performUpkeep` 可能已经翻到下一期
+    （它无权限，任何人可触发）。此时买单会落在一个用户从未选择的期上——奖池规模、
+    已售票数、中奖概率、距停售还剩多久全都与他下单时看到的不同。钱不会丢，
+    但「买到的不是看到的」在彩票语境下就是错误成交
+  - **MUST NOT** 提供「不检查」的哨兵值（如 0 = 任意期）：那会成为集成方的默认选择，
+    等于把这道闸退化成可选项，footgun 原样保留
+  - `injectPot` 早已显式接受 `roundId`，本条只是让 `buyTickets` 与之一致
+  - ⚠️ **`expectedRoundId` MUST 来自链下**（用户下单那一刻的读数）。在同一笔交易里
+    现读 `s_currentRound()` 再传进来是**完全无效的**——那只是把当前值和它自己比，
+    恒等成立。前端 **MUST** 传界面上显示给用户的那个期号
+  - 验收：`test/LotteryR20Fixes.t.sol::test_RevertWhen_RoundRolledOverWhileTxWasPending`
+    （含反向守卫：期号相符时照常成交；未来期号同样拒绝）
 - **FR-C-10** 发起 VRF 请求后 **MUST** 立即开启下一期，不等回调
   - 验收：`performUpkeep` 后 `currentRound` 已 +1 且新期可购票
 
@@ -253,6 +267,15 @@ Chainlink VRF/Automation 集成、gas 优化、Foundry 测试（含 fuzz 与不�
       代价是正常参与者拿到的 carry 也一起减半（产品决策，未实施）
   - 验收：注资 10000、仅买 8 张时至多拿回「本金 + 等额 carry」，其余留在缓冲
 
+- **FR-C-26a**（2026-08-15 增，R21 C-1）`injectPot` **MUST** 与 `buyTickets` 共用
+  同一道暂停闸（`salesPausedAtOpen`），暂停期开出的期一律拒绝注资。
+  - **这不是语义洁癖**：暂停状态在开期时被快照定死，因此「开期即暂停」的期
+    **永远不可能有票**（`buyTickets` 恒 revert，事后恢复售票也改不了这一期的快照），
+    必然以 `ticketCount == 0` 走到 VOIDED。往这样的期注资，那笔钱**必然**流进
+    滚存缓冲区——而缓冲区没有退出通道（FR-C-28）。缺了这道闸，`injectPot`
+    就是一条把资金单向送进黑洞的合法入口
+  - 验收：`test/AuditR21Poc.t.sol::test_Fix_InjectPotHonorsTheSalesPauseSnapshot`
+    （含反向守卫：恢复售票后新开的期照常接受注资）
 - **FR-C-26** 冷启动注资（2026-08-07 增；2026-08-11 随 FR-C-01 改为原生币）：
   **MUST** 提供 `injectPot(uint32 roundId) payable`，任何人可向处于 OPEN 状态的期
   注入原生币，`msg.value` 全额计入该期 pot、不抽成，emit `PotInjected`。

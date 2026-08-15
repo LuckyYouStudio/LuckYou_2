@@ -32,8 +32,9 @@ contract LotteryVrfOutageTest is LotteryTestBase {
         assertEq(uint8(_stateOf(next)), uint8(Lottery.RoundState.OPEN));
 
         vm.deal(bob, bob.balance + (5e14));
+        uint32 _rid1 = lottery.s_currentRound();
         vm.startPrank(bob);
-        lottery.buyTickets{value: PRICE * 5}(5); // 新期可正常购票
+        lottery.buyTickets{value: PRICE * 5}(5, _rid1); // 新期可正常购票
         vm.stopPrank();
         assertEq(lottery.ticketsOwned(next, bob), 5);
     }
