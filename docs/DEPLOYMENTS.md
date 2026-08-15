@@ -28,13 +28,26 @@
 | Basescan | 已验证（Lottery + LotteryAdmin） |
 | ⚠️ 已知缺陷 | **这是第 50 轮审计修复前的字节码**，不含 A-1（提费预留）、A-2（`refundAbandonedTo`）、A-3（`claimKeeperRewardTo`）、A-4（锚点闸）。详见 `audit/AUDIT-2026-08-14-R50.md` |
 
-> **CRE 桥接器 `0x8081f1cB5F5381ed3E5883950fb1925642071bf5` 必须重新部署**
-> （第 50 轮 A-3）：它转调 `performUpkeep` 时 `msg.sender` 是它自己，
-> FR-C-30 的开奖奖励因此记在它名下，而旧版**既无领取路径也无 `receive`**——
-> 每一期最多一张票价的运营抽成会被永久锁死。新版构造器多一个
-> `rewardBeneficiary` 参数，且新桥接器**对当前这个 Lottery 完全兼容**，
-> 单独重部它即可，不必重部 Lottery。重部后记得更新
-> `keeper-cre/luckyou-keeper/config.production.json` 的 `receiverAddress`。
+### CRE 桥接器（第 50 轮 A-3 已修，2026-08-14 重部）
+
+| | |
+|---|---|
+| **LotteryKeeperReceiver** | `0xc2283138043AFBF7250f59B02f7a00117eA07a31` |
+| 构造参数 | forwarder `0xF8344CFd5c43616a4366C34E3EEE75af79a74482`（从旧桥接器 `getForwarderAddress()` 读出）、lottery `0x23bec642…`、rewardBeneficiary `0xA7b454432E0Ffe2e9C394c6045ec652e3b1e743f`（treasury） |
+| Basescan | 已验证 |
+| 链上实测 | `sweepKeeperReward()` 存在且端到端跑通（转入 1 wei → 扫出 → 余额归零 → 再扫返回 `NothingToSweep`）；`receive()` 可收款 |
+
+**旧桥接器 `0x8081f1cB…` 已弃用**，原因有两条而不是一条：
+
+1. 第 50 轮 A-3：它转调 `performUpkeep` 时 `msg.sender` 是它自己，FR-C-30 的开奖奖励
+   记在它名下，而它**既无领取路径也无 `receive`**——那笔抽成会被永久锁死。
+2. **它的 `i_lottery` 指向 `0xd3c091A3…`，即最早的 USDC 版彩票。**
+   lottery 地址是 immutable，之后重部过四次 Lottery 都改不到它——
+   改 `config.production.json` 的 `receiverAddress` 没有用。
+   这一条是重部时才发现的，报告里没有。
+
+> 教训：桥接器把 lottery 地址烧成 immutable，因此**每次重部 Lottery 都必须连带重部桥接器**。
+> 只改配置文件会得到一个「配置看起来对、链上指向错」的静默失效状态。
 
 `Lottery` 构造参数：
 
