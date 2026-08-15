@@ -74,8 +74,19 @@ try {
     $count = [int](("" + $info[3]).Trim() -replace '\s.*$','')
     $now   = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 
-    $target = 3 + ([int]$round % 7)   # 3~9 张，随期号变化
-    if ($state -eq 0 -and $now -lt $close -and $count -lt $target) {
+    # RoundState 枚举是 NONE=0, OPEN=1, DRAWING=2, ... —— **OPEN 是 1 不是 0**。
+    # 这里写错过一次：$state -eq 0 永远不成立，驱动器一张票都不会买，
+    # 每期零票 VOID，而日志看起来一切正常。用具名常量而不是裸数字
+    $ST_OPEN = 1
+    # 目标票数随期号在 3~9 变化（刻意不取整，让取整余数与配比释放走到不同分支）；
+    # DRIVER_TARGET 可覆盖，便于调票量或做一次性验证
+    $target = if ($envMap['DRIVER_TARGET']) { [int]$envMap['DRIVER_TARGET'] } else { 3 + ([int]$round % 7) }
+
+    # 心跳：每次运行都留一行。否则「没事可做」和「脚本崩了」在日志里长得一模一样，
+    # 而计划任务是看不见的——静默是这类脚本最难排查的失败模式
+    Write-Log ("TICK   第 {0} 期 state={1} 票数={2}/{3} 距停售={4}s" -f $round, $state, $count, $target, ($close - $now))
+
+    if ($state -eq $ST_OPEN -and $now -lt $close -and $count -lt $target) {
         $qty = $target - $count
         $price = [decimal](("" + (Cast-Call @('i_ticketPrice()(uint256)'))).Trim() -replace '\s.*$','')
         $wei = [System.Numerics.BigInteger]::Parse(($price * $qty).ToString('F0'))
