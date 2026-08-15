@@ -6,7 +6,8 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "sync-abi": "node scripts/sync-abi.mjs"
+    "sync-abi": "node scripts/sync-abi.mjs",
+    "observe": "node scripts/observe.mjs"
   },
   "dependencies": {
     "next": "^15.4.6",

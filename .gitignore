@@ -2,6 +2,12 @@
 .env
 .env.local
 
+# keystore 密码文件（多期验证驱动器用，见 docs/VALIDATION.md）。
+# 通配而不是只写一个具体名字：漏一个就是把密码推上去，代价不对称
+*.pass
+.keeper-pass
+keystores/
+
 # Foundry
 contracts/out/
 contracts/cache/
