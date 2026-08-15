@@ -16,56 +16,24 @@
 
 ## Base Sepolia（chainId 84532）
 
-### 当前实例
+### 当前实例（2026-08-14，含第 50 轮全部修复）
 
 | | |
 |---|---|
-| **Lottery** | `0x23bec642861319f5eDc6716A881164Aee3585b37` |
-| **LotteryAdmin** | `0x0dCDfaBeA5a134B5d42A3a3BCbdb19e82181EF0A` |
-| **commit** | `728d3dd8b830f51cb4286d128a07e65c832f374e` |
-| 部署日期 | 2026-08-13 |
-| 含有 | 原生 ETH、claimTo、Q9 方案 B（LotteryAdmin）+ C（弃期退款）、FR-C-30 开奖激励 |
-| Basescan | 已验证（Lottery + LotteryAdmin） |
-| ⚠️ 已知缺陷 | **这是第 50 轮审计修复前的字节码**，不含 A-1（提费预留）、A-2（`refundAbandonedTo`）、A-3（`claimKeeperRewardTo`）、A-4（锚点闸）。详见 `audit/AUDIT-2026-08-14-R50.md` |
+| **Lottery** | `0x89412E2f96b90f8FFFf52e3f6749b5BbA7cE731c` |
+| **LotteryAdmin** | `0x9286d564901560Ae1926457df824B188158F878C` |
+| **CRE 桥接器** | `0x4f073D1C95CE471e698E5c648fA6f95244427df6` |
+| **commit** | `d994d66572925d2e16e5f2b8b41ac2d725e4372b` |
+| **anchorTime** | **`1786760860`** |
+| 含有 | 原生 ETH、claimTo、Q9 方案 B+C、FR-C-30 开奖激励、**第 50 轮 A-1~A-4** |
+| Basescan | 三个合约均已验证 |
+| 链上实测 | A-1 提费预留生效（抽成 1e14 / 可提 8e13 / 提后预留 2e13）；A-2 `refundAbandonedTo`、A-3 `claimKeeperRewardTo` 均返回 `InvalidRecipient`（旧版为函数不存在的空 revert）；`owner()` = LotteryAdmin |
 
-### CRE 桥接器（第 50 轮 A-3 已修，2026-08-14 重部）
+其余构造参数同下表（coordinator / keyHash / ticketPrice / intervals / treasury / feeBps / tierBps / tierWinnerCounts 未变）。
 
-| | |
-|---|---|
-| **LotteryKeeperReceiver** | `0xc2283138043AFBF7250f59B02f7a00117eA07a31` |
-| 构造参数 | forwarder `0xF8344CFd5c43616a4366C34E3EEE75af79a74482`（从旧桥接器 `getForwarderAddress()` 读出）、lottery `0x23bec642…`、rewardBeneficiary `0xA7b454432E0Ffe2e9C394c6045ec652e3b1e743f`（treasury） |
-| Basescan | 已验证 |
-| 链上实测 | `sweepKeeperReward()` 存在且端到端跑通（转入 1 wei → 扫出 → 余额归零 → 再扫返回 `NothingToSweep`）；`receive()` 可收款 |
-
-**旧桥接器 `0x8081f1cB…` 已弃用**，原因有两条而不是一条：
-
-1. 第 50 轮 A-3：它转调 `performUpkeep` 时 `msg.sender` 是它自己，FR-C-30 的开奖奖励
-   记在它名下，而它**既无领取路径也无 `receive`**——那笔抽成会被永久锁死。
-2. **它的 `i_lottery` 指向 `0xd3c091A3…`，即最早的 USDC 版彩票。**
-   lottery 地址是 immutable，之后重部过四次 Lottery 都改不到它——
-   改 `config.production.json` 的 `receiverAddress` 没有用。
-   这一条是重部时才发现的，报告里没有。
-
-> 教训：桥接器把 lottery 地址烧成 immutable，因此**每次重部 Lottery 都必须连带重部桥接器**。
-> 只改配置文件会得到一个「配置看起来对、链上指向错」的静默失效状态。
-
-`Lottery` 构造参数：
-
-| # | 参数 | 值 |
-|---|---|---|
-| 0 | vrfCoordinator | `0x5C210eF41CD1a72de73bF76eC39637bB0d3d7BEE` |
-| 1 | subId | *（见 `contracts/.env` 的 `VRF_SUBSCRIPTION_ID`）* |
-| 2 | keyHash | `0x9e1344a1247c8a1785d0a4681a27152bffdb43666ae5bf7d14d24a5efd44bf71` |
-| 3 | ticketPrice | `100000000000000`（0.0001 ether） |
-| 4 | **anchorTime** | **`1786709230`** |
-| 5 | intervals | `[7200]`（快节奏测试实例） |
-| 6 | treasury | `0xA7b454432E0Ffe2e9C394c6045ec652e3b1e743f` |
-| 7 | feeBps | `100`（1%） |
-| 8 | tierBps | `[6000,2500,1500]` |
-| 9 | tierWinnerCounts | `[1,2,5]` |
-
-`LotteryAdmin` 构造参数：`(lottery, initialOwner)` =
-（上面的 Lottery 地址, `0xA7b454432E0Ffe2e9C394c6045ec652e3b1e743f`）
+> ⚠️ **每次重部 Lottery 都必须连带重部桥接器**：桥接器把 lottery 地址烧成 immutable，
+> 只改 `config.production.json` 的 `receiverAddress` 改不到链上那个值，
+> 会得到一个「配置看起来对、链上指向错」的静默失效状态（2026-08-14 实际踩到）。
 
 ### 历史实例（已弃用，勿再使用）
 

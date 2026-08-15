@@ -103,3 +103,14 @@ pnpm lint
   结果每次触发闪一次黑框**并抢焦点**（表现为「Win 键失灵」——开始菜单被下次触发关掉）。
   S4U 登录类型能根治但要管理员权限；无提权的做法是经 `wscript.exe` 启动一个
   `Run(cmd, 0, True)` 的 .vbs（GUI 子系统，自身不建控制台）
+- **slither 报「本机装不了 solc」多半是假的**：它需要一个独立的 solc 可执行文件
+  （foundry 内置的那份它调不到），但本机 `solc-select` 早已安装，只是**没选版本**。
+  两条命令解决，且**必须装 0.8.26**——项目 pragma 是固定版本不带 `^`，
+  装成默认的 0.8.36 会直接编译不过：
+  ```bash
+  export PATH="$HOME/AppData/Local/Programs/Python/Python312/Scripts:$PATH"
+  solc-select install 0.8.26 && solc-select use 0.8.26
+  slither .    # 记得从 contracts/ 跑，且 foundry 也要在 PATH 上
+  ```
+  另注：`slither . --filter-paths "lib/|test/"` 用正斜杠在 Windows 上**不生效**，
+  会假报 `0 result(s) found`。核对时必须不带过滤跑一遍，再自行按路径筛。
