@@ -103,6 +103,23 @@ pnpm lint
   结果每次触发闪一次黑框**并抢焦点**（表现为「Win 键失灵」——开始菜单被下次触发关掉）。
   S4U 登录类型能根治但要管理员权限；无提权的做法是经 `wscript.exe` 启动一个
   `Run(cmd, 0, True)` 的 .vbs（GUI 子系统，自身不建控制台）
+- **PowerShell 5.1 里 `$ErrorActionPreference='Stop'` + 原生命令 `2>&1` = 定时炸弹**
+  （2026-08-15 实测，驱动器连抛 1.5 小时才被发现）。重定向会把 stderr 每行包成
+  ErrorRecord（NativeCommandError）并**升级为终止性错误**，于是
+  「先跑再查 `$LASTEXITCODE` 决定怎么办」这套写法**根本执行不到**——直接跳去 catch，
+  **把整个 try 块剩下的步骤全部中断**。
+  最阴的是它只在原生命令失败时才发作：`cast call` 一路成功时毫无征兆，
+  等到某次正常 revert（`NothingToClaim` 这种预期内的失败）才炸，
+  而那时你已经默认这段代码是好的了。
+  解法是在重定向期间临时把 EAP 降为 `Continue`，既留住 stderr 文本用于记日志，
+  又让退出码回到「可判断」而不是「已爆炸」：
+  ```powershell
+  $saved = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  try { $out = & $exe @args 2>&1 | ForEach-Object { "$_" }
+        return @{ ok = ($LASTEXITCODE -eq 0); out = ($out -join "`n") } }
+  finally { $ErrorActionPreference = $saved }
+  ```
+
 - **生成 Windows 脚本时，内容里不要写字面反斜杠**（2026-08-15 踩到）。
   经 heredoc/python 这条链路写文件，双反斜杠会被折叠，于是本该是路径分隔符的
   `\` + `v` 变成**真的垂直制表符 0x0B**，文件在那里被无声截断。

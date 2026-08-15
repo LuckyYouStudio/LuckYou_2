@@ -53,13 +53,30 @@ try {
         exit 0
     }
 
-    # 领奖/领激励要按「我是谁」判断，所以得先知道签名地址。
-    # 从 keystore 反推，不硬编码——换密钥时不改脚本
-    $signerAddr = ("" + (& $cast wallet address @signArgs 2>&1)).Trim()
-    if ($signerAddr -notmatch '^0x[0-9a-fA-F]{40}$') { Write-Log "ABORT  取签名地址失败：$signerAddr"; exit 0 }
+    # PowerShell 5.1 陷阱（2026-08-15 实测踩到，连抛了 1.5 小时）：
+    # $ErrorActionPreference = 'Stop' 配上原生命令的 2>&1，stderr 会被包成
+    # ErrorRecord（NativeCommandError）并升级为**终止性错误** —— 于是
+    # 「检查 $LASTEXITCODE 再决定怎么办」这套写法根本执行不到，直接跳去 catch，
+    # 把整个 try 块中断，后面的步骤全部不再运行。
+    # 这里在重定向期间临时把 EAP 降为 Continue：既保留 stderr 文本用于记日志，
+    # 又让退出码回到「可判断」而不是「已爆炸」。
+    function Invoke-Cast([string[]]$a) {
+        $saved = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $out = & $cast @a 2>&1 | ForEach-Object { "$_" }
+            return @{ ok = ($LASTEXITCODE -eq 0); out = ($out -join "`n") }
+        } finally { $ErrorActionPreference = $saved }
+    }
+    function Cast-Call([string[]]$a) { (Invoke-Cast (@('call', $L) + $a + @('--rpc-url', $rpc, '--block', 'latest'))).out -split "`n" }
+    function Cast-Send([string[]]$a) { (Invoke-Cast (@('send', $L) + $a + @('--rpc-url', $rpc) + $signArgs)).out }
 
-    function Cast-Call([string[]]$a) { & $cast call $L @a --rpc-url $rpc --block latest 2>&1 }
-    function Cast-Send([string[]]$a) { & $cast send $L @a --rpc-url $rpc @signArgs 2>&1 }
+    # 领奖/领激励要按「我是谁」判断，所以得先知道签名地址。
+    # 从 keystore 反推，不硬编码——换密钥时不改脚本。
+    # 必须走 Invoke-Cast（定义在上面）：直接 `& $cast ... 2>&1` 在解锁失败时会抛，
+    # 走不到下面这行 ABORT，等于白写
+    $signerAddr = (Invoke-Cast (@('wallet', 'address') + $signArgs)).out.Trim()
+    if ($signerAddr -notmatch '^0x[0-9a-fA-F]{40}$') { Write-Log "ABORT  取签名地址失败：$signerAddr"; exit 0 }
 
     # ---- ① 到点就开奖（顺带验证 FR-C-30 开奖激励）----
     $need = (Cast-Call @('checkUpkeep(bytes)(bool,bytes)', '0x')) | Select-Object -First 1
@@ -119,8 +136,10 @@ try {
         $ST_SETTLED = 3
         if ([int](("" + $pinfo[0]).Trim()) -eq $ST_SETTLED) {
             foreach ($tier in 0, 1, 2) {
-                $sim = & $cast call $L 'claim(uint32,uint8)' "$prev" "$tier" --from $signerAddr --rpc-url $rpc 2>&1
-                if ($LASTEXITCODE -ne 0) { continue }   # 没中这一档，或已领过
+                # 没中这一档（NothingToClaim）或已领过（AlreadyClaimed）时模拟会 revert，
+                # 这是**正常且频繁**的情况，不是异常——绝不能让它中断后面的步骤
+                $sim = Invoke-Cast @('call', $L, 'claim(uint32,uint8)', "$prev", "$tier", '--from', $signerAddr, '--rpc-url', $rpc)
+                if (-not $sim.ok) { continue }
                 Write-Log "CLAIM  第 $prev 期 T$tier 可领，发起领奖"
                 $r = Cast-Send @('claim(uint32,uint8)', "$prev", "$tier")
                 if ("$r" -match 'status\s+1') { Write-Log "CLAIM  T$tier 成功" } else { Write-Log "CLAIM  T$tier 失败：$r" }
